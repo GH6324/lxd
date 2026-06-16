@@ -5,7 +5,7 @@
 # ./least.sh NAT服务器前缀 数量
 # 2026.02.28
 
-cd /root >/dev/null 2>&1
+cd /root >/dev/null 2>&1 || exit 1
 if [ ! -d "/usr/local/bin" ]; then
     mkdir -p "/usr/local/bin"
 fi
@@ -65,8 +65,43 @@ check_china() {
     fi
 }
 
+validate_positive_int() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+validate_inputs() {
+    if [ -z "${1:-}" ] || ! validate_positive_int "${2:-}"; then
+        echo "Usage: $0 <container_prefix> <container_count>"
+        echo "用法: $0 <容器前缀> <容器数量>"
+        exit 1
+    fi
+    if [ $((20000 + $2)) -gt 65535 ]; then
+        echo "Error: generated SSH port exceeds 65535."
+        echo "错误：生成的 SSH 端口超过 65535。"
+        exit 1
+    fi
+}
+
+replace_proxy_device() {
+    local device_name="$1"
+    shift
+    lxc config device remove "$name" "$device_name" 2>/dev/null || true
+    lxc config device add "$name" "$device_name" proxy "$@"
+}
+
+download_host_file() {
+    local url="$1"
+    local output="$2"
+    if ! curl -fsSLk "$url" -o "$output"; then
+        echo "Failed to download: $url"
+        echo "下载失败：$url"
+        exit 1
+    fi
+}
+
+validate_inputs "$1" "$2"
 check_china
-rm -rf log
+rm -f -- log
 lxc init opsmaru:debian/12 "$1" -c limits.cpu=1 -c limits.memory=128MiB -s default
 if [ -f /usr/local/bin/lxd_storage_type ]; then
     storage_type=$(cat /usr/local/bin/lxd_storage_type)
@@ -116,13 +151,13 @@ else
 fi
 save_firewall_rules
 if [ ! -f /usr/local/bin/ssh_bash.sh ]; then
-    curl -L https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_bash.sh -o /usr/local/bin/ssh_bash.sh
+    download_host_file https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_bash.sh /usr/local/bin/ssh_bash.sh
     chmod 777 /usr/local/bin/ssh_bash.sh
     dos2unix /usr/local/bin/ssh_bash.sh
 fi
 cp /usr/local/bin/ssh_bash.sh /root
 if [ ! -f /usr/local/bin/config.sh ]; then
-    curl -L https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/config.sh -o /usr/local/bin/config.sh
+    download_host_file https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/config.sh /usr/local/bin/config.sh
     chmod 777 /usr/local/bin/config.sh
     dos2unix /usr/local/bin/config.sh
 fi
@@ -162,7 +197,7 @@ for ((a = 1; a <= "$2"; a++)); do
         lxc exec "$name" -- curl -lk https://gitee.com/SuperManito/LinuxMirrors/raw/main/ChangeMirrors.sh -o ChangeMirrors.sh
         lxc exec "$name" -- chmod 777 ChangeMirrors.sh
         lxc exec "$name" -- ./ChangeMirrors.sh --source mirrors.tuna.tsinghua.edu.cn --web-protocol http --intranet false --backup true --updata-software false --clean-cache false --ignore-backup-tips
-        lxc exec "$name" -- rm -rf ChangeMirrors.sh
+        lxc exec "$name" -- rm -f -- ChangeMirrors.sh
     fi
     lxc exec "$name" -- sudo apt-get update -y
     lxc exec "$name" -- sudo apt-get install curl -y --fix-missing
@@ -170,7 +205,7 @@ for ((a = 1; a <= "$2"; a++)); do
     lxc file push /root/ssh_bash.sh "$name"/root/
     lxc exec "$name" -- chmod 777 ssh_bash.sh
     lxc exec "$name" -- dos2unix ssh_bash.sh
-    lxc exec "$name" -- sudo ./ssh_bash.sh $passwd
+    lxc exec "$name" -- sudo ./ssh_bash.sh "$passwd"
     lxc file push /root/config.sh "$name"/root/
     lxc exec "$name" -- chmod +x config.sh
     lxc exec "$name" -- dos2unix config.sh
@@ -182,8 +217,8 @@ for ((a = 1; a <= "$2"; a++)); do
             exit 1
         fi
     fi
-    lxc config device add "$name" ssh-port proxy listen=tcp:$ipv4_address:$sshn connect=tcp:0.0.0.0:22 nat=true
+    replace_proxy_device ssh-port "listen=tcp:$ipv4_address:$sshn" connect=tcp:0.0.0.0:22 nat=true
     lxc config set "$name" user.description "$name $sshn $passwd"
     echo "$name $sshn $passwd" >>log
 done
-rm -rf ssh_bash.sh config.sh ssh_sh.sh
+rm -f -- ssh_bash.sh config.sh ssh_sh.sh

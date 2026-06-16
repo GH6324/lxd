@@ -49,21 +49,32 @@ validate_inputs() {
 replace_proxy_device() {
     local device_name="$1"
     shift
-    if lxc config device show "$name" 2>/dev/null | grep -q "^${device_name}:"; then
-        lxc config device remove "$name" "$device_name" 2>/dev/null || true
-    fi
+    lxc config device remove "$name" "$device_name" 2>/dev/null || true
     lxc config device add "$name" "$device_name" proxy "$@"
 }
 
 remove_device_if_exists() {
     local device_name="$1"
-    if lxc config device show "$name" 2>/dev/null | grep -q "^${device_name}:"; then
-        lxc config device remove "$name" "$device_name" 2>/dev/null || true
+    lxc config device remove "$name" "$device_name" 2>/dev/null || true
+}
+
+ensure_container_ipv6_cron() {
+    # shellcheck disable=SC2016
+    lxc exec "$name" -- sh -c 'cron_line="*/1 * * * * curl -m 6 -s ipv6.ip.sb && curl -m 6 -s ipv6.ip.sb"; if ! crontab -l 2>/dev/null | grep -Fqx "$cron_line"; then (crontab -l 2>/dev/null; printf "%s\n" "$cron_line") | crontab -; fi'
+}
+
+download_file() {
+    local url="$1"
+    local output="$2"
+    if ! curl -fsSLk "$url" -o "$output"; then
+        echo "Failed to download: $url"
+        echo "下载失败：$url"
+        exit 1
     fi
 }
 
 # 创建容器
-cd /root >/dev/null 2>&1
+cd /root >/dev/null 2>&1 || exit 1
 name="${1:-test}"
 sshn="${2:-20001}"
 nat1="${3:-20002}"
@@ -103,17 +114,17 @@ else
 fi
 if echo "$system" | grep -qiE "alpine" || echo "$system" | grep -qiE "openwrt"; then
     if [ ! -f /usr/local/bin/ssh_sh.sh ]; then
-        curl -L https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_sh.sh -o /usr/local/bin/ssh_sh.sh
+        download_file https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_sh.sh /usr/local/bin/ssh_sh.sh
         chmod 777 /usr/local/bin/ssh_sh.sh
         dos2unix /usr/local/bin/ssh_sh.sh
     fi
     cp /usr/local/bin/ssh_sh.sh /root
     lxc file push /root/ssh_sh.sh "$name"/root/
     lxc exec "$name" -- chmod 777 ssh_sh.sh
-    lxc exec "$name" -- ./ssh_sh.sh ${passwd}
+    lxc exec "$name" -- ./ssh_sh.sh "$passwd"
 else
     if [ ! -f /usr/local/bin/ssh_bash.sh ]; then
-        curl -L https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_bash.sh -o /usr/local/bin/ssh_bash.sh
+        download_file https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_bash.sh /usr/local/bin/ssh_bash.sh
         chmod 777 /usr/local/bin/ssh_bash.sh
         dos2unix /usr/local/bin/ssh_bash.sh
     fi
@@ -121,9 +132,9 @@ else
     lxc file push /root/ssh_bash.sh "$name"/root/
     lxc exec "$name" -- chmod 777 ssh_bash.sh
     lxc exec "$name" -- dos2unix ssh_bash.sh
-    lxc exec "$name" -- sudo ./ssh_bash.sh $passwd
+    lxc exec "$name" -- sudo ./ssh_bash.sh "$passwd"
     if [ ! -f /usr/local/bin/config.sh ]; then
-        curl -L https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/config.sh -o /usr/local/bin/config.sh
+        download_file https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/config.sh /usr/local/bin/config.sh
         chmod 777 /usr/local/bin/config.sh
         dos2unix /usr/local/bin/config.sh
     fi
@@ -134,22 +145,23 @@ else
     lxc exec "$name" -- bash config.sh
     lxc exec "$name" -- history -c
 fi
-replace_proxy_device ssh-port listen=tcp:0.0.0.0:$sshn connect=tcp:0.0.0.0:22 nat=true
+replace_proxy_device ssh-port "listen=tcp:0.0.0.0:$sshn" connect=tcp:0.0.0.0:22 nat=true
 # 是否要创建V6地址
 if [ -n "$enable_ipv6" ]; then
     if [ "$enable_ipv6" == "Y" ]; then
-        lxc exec "$name" -- sh -c 'echo "*/1 * * * * curl -m 6 -s ipv6.ip.sb && curl -m 6 -s ipv6.ip.sb" | crontab -'
+        ensure_container_ipv6_cron
         sleep 1
         if [ ! -f "./build_ipv6_network.sh" ]; then
             # 如果不存在，则从指定 URL 下载并添加可执行权限
-            curl -L https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/build_ipv6_network.sh -o build_ipv6_network.sh && chmod +x build_ipv6_network.sh
+            download_file https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/build_ipv6_network.sh build_ipv6_network.sh
+            chmod +x build_ipv6_network.sh
         fi
         ./build_ipv6_network.sh "$name"
     fi
 fi
 if [ "$nat1" != "0" ] && [ "$nat2" != "0" ]; then
-    replace_proxy_device nattcp-ports listen=tcp:0.0.0.0:$nat1-$nat2 connect=tcp:0.0.0.0:$nat1-$nat2 nat=true
-    replace_proxy_device natudp-ports listen=udp:0.0.0.0:$nat1-$nat2 connect=udp:0.0.0.0:$nat1-$nat2 nat=true
+    replace_proxy_device nattcp-ports "listen=tcp:0.0.0.0:$nat1-$nat2" "connect=tcp:0.0.0.0:$nat1-$nat2" nat=true
+    replace_proxy_device natudp-ports "listen=udp:0.0.0.0:$nat1-$nat2" "connect=udp:0.0.0.0:$nat1-$nat2" nat=true
 else
     remove_device_if_exists nattcp-ports
     remove_device_if_exists natudp-ports
@@ -168,7 +180,7 @@ if ! lxc config device override "$name" eth0 limits.egress="$out"Mbit limits.ing
     lxc config device set "$name" eth0 limits.max "$speed_limit"Mbit
 fi
 lxc start "$name"
-rm -rf ssh_bash.sh config.sh ssh_sh.sh
+rm -f -- ssh_bash.sh config.sh ssh_sh.sh
 if echo "$system" | grep -qiE "alpine"; then
     sleep 3
     lxc stop "$name"

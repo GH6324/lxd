@@ -4,10 +4,10 @@
 # 2025.04.20
 
 # cd /root
-red() { echo -e "\033[31m\033[01m$@\033[0m"; }
-green() { echo -e "\033[32m\033[01m$@\033[0m"; }
-yellow() { echo -e "\033[33m\033[01m$@\033[0m"; }
-blue() { echo -e "\033[36m\033[01m$@\033[0m"; }
+red() { printf '\033[31m\033[01m%s\033[0m\n' "$*"; }
+green() { printf '\033[32m\033[01m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m\033[01m%s\033[0m\n' "$*"; }
+blue() { printf '\033[36m\033[01m%s\033[0m\n' "$*"; }
 reading() { read -rp "$(green "$1")" "$2"; }
 
 is_true() {
@@ -49,6 +49,156 @@ normalize_ipv6_status() {
     fi
 }
 
+strip_image_separators() {
+    local value="$1"
+    while [[ "$value" == [/:_.-]* ]]; do
+        value="${value#?}"
+    done
+    while [[ "$value" == *[/:_.-] ]]; do
+        value="${value%?}"
+    done
+    printf '%s\n' "$value"
+}
+
+canonical_image_family() {
+    local family="$1"
+    case "$family" in
+    alma) family="almalinux" ;;
+    rocky) family="rockylinux" ;;
+    oraclelinux | oracle-linux | oracle_linux) family="oracle" ;;
+    arch) family="archlinux" ;;
+    esac
+    printf '%s\n' "$family"
+}
+
+normalize_image_system() {
+    local raw="${1:-}"
+    local input prefix
+    input="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    input="${input#images:}"
+    input="${input#opsmaru:}"
+    input="$(strip_image_separators "$input")"
+    if [ -z "$input" ]; then
+        return 1
+    fi
+    if [[ "$input" == */* ]]; then
+        a="${input%%/*}"
+        b="${input#*/}"
+        b="${b%%/*}"
+    else
+        prefix="${input%%[0-9]*}"
+        if [ "$prefix" != "$input" ]; then
+            a="$prefix"
+            b="${input#"$prefix"}"
+        else
+            a="$input"
+            b=""
+        fi
+    fi
+    a="$(strip_image_separators "$a")"
+    b="$(strip_image_separators "$b")"
+    a="$(canonical_image_family "$a")"
+    normalized_system="${a}${b}"
+    [ -n "$a" ]
+}
+
+image_name_matches_system() {
+    local image_name="$1"
+    [ -n "${a:-}" ] || return 1
+    if [ -z "${b:-}" ]; then
+        [[ "$image_name" == "${a}_"* ]]
+        return
+    fi
+    [[ "$image_name" == "${a}_${b}"* ]]
+}
+
+find_matching_image_from_stream() {
+    local image_name
+    while IFS= read -r image_name; do
+        [ -n "$image_name" ] || continue
+        if image_name_matches_system "$image_name"; then
+            printf '%s\n' "$image_name"
+            return 0
+        fi
+    done
+    return 1
+}
+
+remote_image_query() {
+    if [ -n "${b:-}" ]; then
+        printf '%s/%s\n' "$a" "$b"
+    else
+        printf '%s\n' "$a"
+    fi
+}
+
+find_remote_image_alias() {
+    local remote="$1"
+    local image_type="$2"
+    local query
+    command -v lxc >/dev/null 2>&1 || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    query="$(remote_image_query)"
+    lxc image list "${remote}:${query}" --format=json 2>/dev/null | jq -r --arg ARCHITECTURE "${sys_bit:-}" --arg ARCHITECTURE_ALT "${sys_bit_alt:-}" --arg IMAGE_TYPE "$image_type" '
+        .[]?
+        | select((.type // "") == $IMAGE_TYPE)
+        | select($ARCHITECTURE == "" or (.architecture // "") == $ARCHITECTURE or ($ARCHITECTURE_ALT != "" and (.architecture // "") == $ARCHITECTURE_ALT))
+        | .aliases[]?
+        | .name // empty
+        | select(length > 0)
+    ' | head -n 1
+}
+
+detect_image_arch() {
+    sys_bit=""
+    sys_bit_alt=""
+    self_image_arch=""
+    sysarch="$(uname -m)"
+    case "${sysarch}" in
+    "x86_64" | "x86" | "amd64" | "x64")
+        sys_bit="x86_64"
+        sys_bit_alt="amd64"
+        self_image_arch="x86_64"
+        ;;
+    "i386" | "i686")
+        sys_bit="i686"
+        sys_bit_alt="i386"
+        ;;
+    "aarch64" | "armv8" | "armv8l")
+        sys_bit="aarch64"
+        sys_bit_alt="arm64"
+        self_image_arch="arm64"
+        ;;
+    "armv7l")
+        sys_bit="armv7l"
+        sys_bit_alt="armhf"
+        ;;
+    "s390x") sys_bit="s390x" ;;
+    "ppc64le") sys_bit="ppc64le" ;;
+    *)
+        sys_bit="x86_64"
+        sys_bit_alt="amd64"
+        self_image_arch="x86_64"
+        ;;
+    esac
+}
+
+container_system_available() {
+    local matched_image
+    if [ -n "${self_image_arch:-}" ]; then
+        matched_image=$(curl -fsSLk -m 10 "${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd_images/main/${self_image_arch}_all_images.txt" 2>/dev/null | find_matching_image_from_stream)
+        if [ -n "$matched_image" ]; then
+            return 0
+        fi
+    fi
+    matched_image="$(find_remote_image_alias images container)"
+    if [ -n "$matched_image" ]; then
+        return 0
+    fi
+    matched_image="$(find_remote_image_alias opsmaru container)"
+    [ -n "$matched_image" ]
+}
+
 utf8_locale=$(locale -a 2>/dev/null | grep -i -m 1 -E "utf8|UTF-8")
 if [[ -z "$utf8_locale" ]]; then
     yellow "No UTF-8 locale found"
@@ -65,7 +215,8 @@ fi
 
 check_cdn() {
     local o_url=$1
-    local shuffled_cdn_urls=($(shuf -e "${cdn_urls[@]}")) # 打乱数组顺序
+    local shuffled_cdn_urls=()
+    mapfile -t shuffled_cdn_urls < <(printf '%s\n' "${cdn_urls[@]}" | shuf)
     for cdn_url in "${shuffled_cdn_urls[@]}"; do
         if curl -4 -sL -k "$cdn_url$o_url" --max-time 6 | grep -q "success" >/dev/null 2>&1; then
             export cdn_success_url="$cdn_url"
@@ -95,6 +246,16 @@ check_cdn_file() {
 cdn_urls=("https://cdn0.spiritlhl.top/" "http://cdn1.spiritlhl.net/" "http://cdn2.spiritlhl.net/" "http://cdn3.spiritlhl.net/" "http://cdn4.spiritlhl.net/")
 check_cdn_file
 
+download_file() {
+    local url="$1"
+    local output="$2"
+    if ! curl -fsSLk "${cdn_success_url}${url}" -o "$output"; then
+        red "Failed to download: $url"
+        red "下载失败：$url"
+        exit 1
+    fi
+}
+
 pre_check() {
     home_dir=$(eval echo "~$(whoami)")
     if [ "$home_dir" != "/root" ]; then
@@ -106,22 +267,22 @@ pre_check() {
         apt-get install dos2unix -y
     fi
     if [ ! -f ssh_bash.sh ]; then
-        curl -sLk "${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_bash.sh" -o ssh_bash.sh
+        download_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_bash.sh" ssh_bash.sh
         chmod 777 ssh_bash.sh
         dos2unix ssh_bash.sh
     fi
     if [ ! -f ssh_sh.sh ]; then
-        curl -sLk "${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_sh.sh" -o ssh_sh.sh
+        download_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_sh.sh" ssh_sh.sh
         chmod 777 ssh_sh.sh
         dos2unix ssh_sh.sh
     fi
     if [ ! -f config.sh ]; then
-        curl -sLk "${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/config.sh" -o config.sh
+        download_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/config.sh" config.sh
         chmod 777 config.sh
         dos2unix config.sh
     fi
     if [ ! -f buildct.sh ]; then
-        curl -sLk "${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/buildct.sh" -o buildct.sh
+        download_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/buildct.sh" buildct.sh
         chmod 777 buildct.sh
         dos2unix buildct.sh
     fi
@@ -136,10 +297,9 @@ check_log() {
             # echo "$line"
             last_line="$line"
         done <"$log_file"
-        last_line_array=($last_line)
+        read -r -a last_line_array <<< "$last_line"
         container_name="${last_line_array[0]}"
         ssh_port="${last_line_array[1]}"
-        password="${last_line_array[2]}"
         public_port_start="${last_line_array[3]}"
         public_port_end="${last_line_array[4]}"
         if [ -z "$public_port_start" ] || [ -z "$public_port_end" ]; then
@@ -269,34 +429,27 @@ build_new_containers() {
         done
         green "Is IPV6 enabled for each chick?(Leave blank N by default, no V6 address is set):"
         reading "每个容器是否启用IPV6？(默认留空为N，不设置V6地址)：" is_enabled_ipv6
-        sys_bit=""
-        sysarch="$(uname -m)"
-        case "${sysarch}" in
-        "x86_64" | "x86" | "amd64" | "x64") sys_bit="x86_64" ;;
-        "i386" | "i686") sys_bit="i686" ;;
-        "aarch64" | "armv8" | "armv8l") sys_bit="aarch64" ;;
-        "armv7l") sys_bit="armv7l" ;;
-        "s390x") sys_bit="s390x" ;;
-        "ppc64le") sys_bit="ppc64le" ;;
-        *) sys_bit="x86_64" ;;
-        esac
+        detect_image_arch
         while true; do
-            green "What is the system of each container? (Note that the incoming parameter is the system name + version number, e.g. debian11, ubuntu20, centos7):"
-            reading "每个容器的系统是什么？(注意传入参数为系统名字+版本号，如：debian11、ubuntu20、centos7)：" system
+            green "What is the system of each container? (e.g. debian11, debian/11, ubuntu20, centos7):"
+            reading "每个容器的系统是什么？(如：debian11、debian/11、ubuntu20、centos7)：" system
             system="${system:-debian12}"
-            a="${system%%[0-9]*}"
-            b="${system##*[!0-9.]}"
-            output=$(lxc image list images:${a}/${b} --format=json | jq -r --arg ARCHITECTURE "$sys_bit" '.[] | select(.type == "container" and .architecture == $ARCHITECTURE) | .aliases[0].name' | head -n 1)
-            if echo "$output" | grep -q "${a}"; then
+            if ! normalize_image_system "$system"; then
+                yellow "Invalid input, please enter an existing system."
+                yellow "输入无效，请输入一个存在的系统"
+                continue
+            fi
+            system="$normalized_system"
+            if container_system_available; then
                 echo "Matching mirror exists"
                 echo "匹配的镜像存在"
                 break
             else
                 echo "No matching image found, please execute"
-                echo "lxc image list images:system name/version number"
+                echo "lxc image list images:system/version_number OR lxc image list opsmaru:system/version_number"
                 echo "Check if the corresponding image exists"
                 echo "未找到匹配的镜像，请执行"
-                echo "lxc image list images:系统名字/版本号"
+                echo "lxc image list images:系统/版本号 或 lxc image list opsmaru:系统/版本号"
                 echo "查询是否存在对应镜像"
                 yellow "输入无效，请输入一个存在的系统"
             fi
@@ -334,6 +487,12 @@ build_new_containers() {
         exit 1
     fi
     system="${system:-debian12}"
+    if ! normalize_image_system "$system"; then
+        red "SYSTEM_IMAGE must be a valid system name, such as debian12 or debian/12."
+        red "SYSTEM_IMAGE 必须是有效系统名称，例如 debian12 或 debian/12。"
+        exit 1
+    fi
+    system="$normalized_system"
     status_ipv6=$(normalize_ipv6_status "$is_enabled_ipv6")
 
     for ((i = 1; i <= new_nums; i++)); do
@@ -344,7 +503,7 @@ build_new_containers() {
         public_port_end=$(($public_port_start + 24))
         ./buildct.sh "$container_name" "$cpu_nums" "$memory_nums" "$disk_nums" "$ssh_port" "$public_port_start" "$public_port_end" "$input_nums" "$output_nums" "$status_ipv6" "$system"
         cat "$container_name" >>log
-        rm -rf "$container_name"
+        rm -f -- "$container_name"
     done
 }
 

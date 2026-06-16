@@ -4,7 +4,7 @@
 
 # curl -L https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/lxdinstall.sh -o lxdinstall.sh && chmod +x lxdinstall.sh && bash lxdinstall.sh
 
-cd /root >/dev/null 2>&1
+cd /root >/dev/null 2>&1 || exit 1
 REGEX=("debian|astra" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazon linux'" "fedora" "arch" "freebsd")
 RELEASE=("Debian" "Ubuntu" "CentOS" "CentOS" "Fedora" "Arch" "FreeBSD")
 CMD=("$(grep -i pretty_name /etc/os-release 2>/dev/null | cut -d \" -f2)" "$(hostnamectl 2>/dev/null | grep -i system | cut -d : -f2)" "$(lsb_release -sd 2>/dev/null)" "$(grep -i description /etc/lsb-release 2>/dev/null | cut -d \" -f2)" "$(grep . /etc/redhat-release 2>/dev/null)" "$(grep . /etc/issue 2>/dev/null | cut -d \\ -f1 | sed '/^[ ]*$/d')" "$(grep -i pretty_name /etc/os-release 2>/dev/null | cut -d \" -f2)" "$(uname -s)")
@@ -19,10 +19,10 @@ done
 if [ ! -d "/usr/local/bin" ]; then
     mkdir -p /usr/local/bin
 fi
-_red() { echo -e "\033[31m\033[01m$@\033[0m"; }
-_green() { echo -e "\033[32m\033[01m$@\033[0m"; }
-_yellow() { echo -e "\033[33m\033[01m$@\033[0m"; }
-_blue() { echo -e "\033[36m\033[01m$@\033[0m"; }
+_red() { printf '\033[31m\033[01m%s\033[0m\n' "$*"; }
+_green() { printf '\033[32m\033[01m%s\033[0m\n' "$*"; }
+_yellow() { printf '\033[33m\033[01m%s\033[0m\n' "$*"; }
+_blue() { printf '\033[36m\033[01m%s\033[0m\n' "$*"; }
 reading() { read -rp "$(_green "$1")" "$2"; }
 
 # 服务管理兼容性函数
@@ -97,13 +97,13 @@ fi
 
 install_package() {
     package_name=$1
-    if command -v $package_name >/dev/null 2>&1; then
+    if command -v "$package_name" >/dev/null 2>&1; then
         _green "$package_name has been installed"
         _green "$package_name 已经安装"
     else
-        apt-get install -y $package_name
+        apt-get install -y "$package_name"
         if [ $? -ne 0 ]; then
-            apt-get install -y $package_name --fix-missing
+            apt-get install -y "$package_name" --fix-missing
         fi
         _green "$package_name has attempted to install"
         _green "$package_name 已尝试安装"
@@ -112,7 +112,8 @@ install_package() {
 
 check_cdn() {
     local o_url=$1
-    local shuffled_cdn_urls=($(shuf -e "${cdn_urls[@]}")) # 打乱数组顺序
+    local shuffled_cdn_urls=()
+    mapfile -t shuffled_cdn_urls < <(printf '%s\n' "${cdn_urls[@]}" | shuf)
     for cdn_url in "${shuffled_cdn_urls[@]}"; do
         if curl -4 -sL -k "$cdn_url$o_url" --max-time 6 | grep -q "success" >/dev/null 2>&1; then
             export cdn_success_url="$cdn_url"
@@ -139,21 +140,26 @@ check_cdn_file() {
     fi
 }
 
-statistics_of_run_times() {
-    COUNT=$(curl -4 -ksm1 "https://hits.spiritlhl.net/lxd?action=hit&title=Hits&title_bg=%23555555&count_bg=%2324dde1&edge_flat=false" 2>/dev/null ||
-        curl -6 -ksm1 "https://hits.spiritlhl.net/lxd?action=hit&title=Hits&title_bg=%23555555&count_bg=%2324dde1&edge_flat=false" 2>/dev/null)
-    # 使用grep -E代替grep -P以提高兼容性（BusyBox等）
-    if echo "" | grep -P "test" >/dev/null 2>&1; then
-        # 如果grep支持-P，使用原有的Perl正则
-        TODAY=$(echo "$COUNT" | grep -oP '"daily":\s*[0-9]+' | sed 's/"daily":[[:space:]]*\([0-9]*\)/\1/')
-        TOTAL=$(echo "$COUNT" | grep -oP '"total":\s*[0-9]+' | sed 's/"total":[[:space:]]*\([0-9]*\)/\1/')
-    else
-        # 如果grep不支持-P，使用-E兼容写法
-        TODAY=$(echo "$COUNT" | grep -oE '"daily":[[:space:]]*[0-9]+' | sed 's/"daily":[[:space:]]*\([0-9]*\)/\1/')
-        TOTAL=$(echo "$COUNT" | grep -oE '"total":[[:space:]]*[0-9]+' | sed 's/"total":[[:space:]]*\([0-9]*\)/\1/')
+download_file() {
+    local url="$1"
+    local output="$2"
+    if ! curl -fsSLk "${cdn_success_url}${url}" -o "$output"; then
+        _red "Failed to download: ${url}"
+        _red "下载失败：${url}"
+        exit 1
     fi
 }
 
+statistics_of_run_times() {
+    COUNT=$(curl -4 -ksm1 "https://hits.spiritlhl.net/lxd?action=hit&title=Hits&title_bg=%23555555&count_bg=%2324dde1&edge_flat=false" 2>/dev/null ||
+        curl -6 -ksm1 "https://hits.spiritlhl.net/lxd?action=hit&title=Hits&title_bg=%23555555&count_bg=%2324dde1&edge_flat=false" 2>/dev/null)
+    TODAY=$(echo "$COUNT" | grep -oE '"daily":[[:space:]]*[0-9]+' | sed 's/"daily":[[:space:]]*\([0-9]*\)/\1/')
+    TOTAL=$(echo "$COUNT" | grep -oE '"total":[[:space:]]*[0-9]+' | sed 's/"total":[[:space:]]*\([0-9]*\)/\1/')
+}
+
+check_cdn_file
+statistics_of_run_times
+_green "脚本当天运行次数:${TODAY:-0}，累计运行次数:${TOTAL:-0}"
 
 lxc config set core.https_address 0.0.0.0:8443
 service_manager restart snap.lxd.daemon
@@ -172,8 +178,8 @@ files=(
 )
 for file in "${files[@]}"; do
     filename=$(basename "$file")
-    rm -rf "$filename"
-    curl -sLk "${cdn_success_url}${file}" -o "$filename"
+    rm -f -- "$filename"
+    download_file "$file" "$filename"
     chmod 777 "$filename"
     dos2unix "$filename"
 done
@@ -208,10 +214,10 @@ lxc network set lxdbr0 ipv4.dhcp true
 lxc network set lxdbr0 ipv6.dhcp true
 # 解除进程数限制
 if [ -f "/etc/security/limits.conf" ]; then
-    if ! grep -q "*          hard    nproc       unlimited" /etc/security/limits.conf; then
+    if ! grep -Fq "*          hard    nproc       unlimited" /etc/security/limits.conf; then
         echo '*          hard    nproc       unlimited' | sudo tee -a /etc/security/limits.conf
     fi
-    if ! grep -q "*          soft    nproc       unlimited" /etc/security/limits.conf; then
+    if ! grep -Fq "*          soft    nproc       unlimited" /etc/security/limits.conf; then
         echo '*          soft    nproc       unlimited' | sudo tee -a /etc/security/limits.conf
     fi
 fi
@@ -229,11 +235,15 @@ install_package libsqlite3-0
 install_package libsqlite3-dev
 install_package libgd3 
 install_package libgd-dev
-cd /usr/src
-wget https://humdi.net/vnstat/vnstat-2.11.tar.gz
+cd /usr/src || exit 1
+if ! wget https://humdi.net/vnstat/vnstat-2.11.tar.gz; then
+    _red "Failed to download vnstat source."
+    _red "下载 vnstat 源码失败。"
+    exit 1
+fi
 chmod 777 vnstat-2.11.tar.gz
 tar zxvf vnstat-2.11.tar.gz
-cd vnstat-2.11
+cd vnstat-2.11 || exit 1
 ./configure --prefix=/usr --sysconfdir=/etc && make && make install
 cp -v examples/systemd/vnstat.service /etc/systemd/system/
 service_manager enable vnstat
@@ -244,24 +254,25 @@ vnstatd -v
 vnstati -v
 
 # 加装证书
-wget ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/panel_scripts/client.crt -O /root/snap/lxd/common/config/client.crt
+mkdir -p /root/snap/lxd/common/config
+download_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/panel_scripts/client.crt" /root/snap/lxd/common/config/client.crt
 chmod 777 /root/snap/lxd/common/config/client.crt
 # 双确认，部分版本切换了命令
 lxc config trust add /root/snap/lxd/common/config/client.crt
 lxc config trust add-certificate /root/snap/lxd/common/config/client.crt
 lxc config set core.https_address :8443
 # 加载修改脚本
-wget ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/panel_scripts/modify.sh -O /root/modify.sh
+download_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/panel_scripts/modify.sh" /root/modify.sh
 chmod 777 /root/modify.sh
 ufw disable
 if [ ! -f /usr/local/bin/check-dns.sh ]; then
-    wget ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/check-dns.sh -O /usr/local/bin/check-dns.sh
+    download_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/check-dns.sh" /usr/local/bin/check-dns.sh
     chmod +x /usr/local/bin/check-dns.sh
 else
     echo "Script already exists. Skipping installation."
 fi
 if [ ! -f /etc/systemd/system/check-dns.service ]; then
-    wget ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/check-dns.service -O /etc/systemd/system/check-dns.service
+    download_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/check-dns.service" /etc/systemd/system/check-dns.service
     chmod +x /etc/systemd/system/check-dns.service
     service_manager daemon-reload
     service_manager enable check-dns.service
@@ -279,7 +290,9 @@ if [ -f /etc/gai.conf ]; then
     fi
 fi
 lxc remote list
-lxc remote remove spiritlhl
+if lxc remote list 2>/dev/null | grep -q '^| spiritlhl[[:space:]]*|'; then
+    lxc remote remove spiritlhl 2>/dev/null || true
+fi
 lxc remote add spiritlhl https://lxdimages.spiritlhl.net --protocol simplestreams --public
 lxc image list spiritlhl:debian
 lxc remote list

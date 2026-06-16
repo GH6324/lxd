@@ -111,6 +111,10 @@ backup_file() {
     local file=$1
     local backup_suffix=".bak.original"
     local backup_file="${file}${backup_suffix}"
+    if [ ! -f "$file" ]; then
+        echo "源文件 $file 不存在，跳过备份"
+        return 0
+    fi
     if [ ! -f "$backup_file" ]; then
         echo "备份 $file 到 $backup_file"
         cp "$file" "$backup_file"
@@ -138,7 +142,8 @@ adjust_nmcli_ipv6_route_metric() {
     local CONN_NAME=$1
     echo "调整连接 $CONN_NAME 的 IPv6 路由 metric 以降低 IPv6 优先级"
     # 获取当前 IPv6 路由 metric（没找到用默认100）
-    local METRIC=$(nmcli connection show "$CONN_NAME" | grep '^ipv6.route-metric:' | awk '{print $2}')
+    local METRIC
+    METRIC=$(nmcli connection show "$CONN_NAME" | grep '^ipv6.route-metric:' | awk '{print $2}')
     if [ -z "$METRIC" ] || [ "$METRIC" = "--" ]; then
         METRIC=100
     fi
@@ -160,7 +165,8 @@ backup_resolv_conf() {
 
 check_resolv_conf_symlink() {
     if [ -L "/etc/resolv.conf" ]; then
-        local target=$(readlink /etc/resolv.conf)
+        local target
+        target=$(readlink /etc/resolv.conf)
         echo "/etc/resolv.conf 是软链接，指向 $target"
         # 检查是否指向 systemd-resolved 的 stub
         if [[ "$target" == *"systemd/resolve"* ]]; then
@@ -184,7 +190,8 @@ check_dns_already_configured() {
     # 检查当前DNS解析配置
     if command -v nslookup >/dev/null 2>&1; then
         # 获取当前使用的DNS服务器
-        local current_dns=$(nslookup google.com 2>/dev/null | grep -E "Server:|Address:" | head -2 | tail -1 | awk '{print $2}' | cut -d'#' -f1)
+        local current_dns
+        current_dns=$(nslookup google.com 2>/dev/null | grep -E "Server:|Address:" | head -2 | tail -1 | awk '{print $2}' | cut -d'#' -f1)
         for dns in "${DNS_SERVERS_IPV4[@]}" "${DNS_SERVERS_IPV6[@]}"; do
             if [ "$current_dns" = "$dns" ]; then
                 echo "检测到已配置的DNS服务器: $dns"
@@ -207,6 +214,10 @@ check_dns_already_configured() {
 # 配置 systemd-resolved
 configure_systemd_resolved() {
     echo "配置 systemd-resolved..."
+    mkdir -p "$(dirname "$RESOLVED_CONF")"
+    if [ ! -f "$RESOLVED_CONF" ]; then
+        printf '[Resolve]\n' > "$RESOLVED_CONF"
+    fi
     
     # 备份配置文件
     backup_file "$RESOLVED_CONF"
@@ -221,8 +232,10 @@ configure_systemd_resolved() {
         current_dns=$(grep "^DNS=" "$RESOLVED_CONF" | cut -d'=' -f2 | tr -s ' ')
     fi
     
-    local new_dns=$(join " " "${dns_list[@]}")
-    local new_fallback_dns=$(join " " "${fallback_dns_list[@]}")
+    local new_dns
+    local new_fallback_dns
+    new_dns=$(join " " "${dns_list[@]}")
+    new_fallback_dns=$(join " " "${fallback_dns_list[@]}")
     
     # 如果当前配置与新配置相同，跳过
     if [ "$current_dns" = "$new_dns" ]; then
@@ -231,7 +244,8 @@ configure_systemd_resolved() {
     fi
     
     # 创建临时文件进行配置更新
-    local temp_file=$(mktemp)
+    local temp_file
+    temp_file=$(mktemp)
     local updated=false
     local fallback_updated=false
     
@@ -255,7 +269,7 @@ configure_systemd_resolved() {
     # 如果没有找到 DNS= 行，添加到 [Resolve] 段落下
     if ! $updated; then
         # 重新处理文件，在 [Resolve] 段落后添加配置
-        > "$temp_file"  # 清空临时文件
+        : > "$temp_file"  # 清空临时文件
         local in_resolve_section=false
         local dns_added=false
         
@@ -356,8 +370,10 @@ check_nmcli_dns_configured() {
     local TARGET_IPV4="${DNS_SERVERS_IPV4[0]}"
     local TARGET_IPV6="${DNS_SERVERS_IPV6[2]}"
     
-    local CURRENT_IPV4_DNS=$(nmcli connection show "$CONN_NAME" | grep '^ipv4.dns:' | awk '{print $2}')
-    local CURRENT_IPV6_DNS=$(nmcli connection show "$CONN_NAME" | grep '^ipv6.dns:' | awk '{print $2}')
+    local CURRENT_IPV4_DNS
+    local CURRENT_IPV6_DNS
+    CURRENT_IPV4_DNS=$(nmcli connection show "$CONN_NAME" | grep '^ipv4.dns:' | awk '{print $2}')
+    CURRENT_IPV6_DNS=$(nmcli connection show "$CONN_NAME" | grep '^ipv6.dns:' | awk '{print $2}')
     
     # 检查是否包含我们的目标DNS服务器
     if echo "$CURRENT_IPV4_DNS" | grep -qw "$TARGET_IPV4" && echo "$CURRENT_IPV6_DNS" | grep -qw "$TARGET_IPV6"; then
@@ -372,7 +388,8 @@ check_resolvectl_dns_configured() {
     local TARGET_IPV4="${DNS_SERVERS_IPV4[0]}"
     local TARGET_IPV6="${DNS_SERVERS_IPV6[2]}"
     
-    local CURRENT_DNS=$(resolvectl dns "$IFACE" 2>/dev/null || echo "")
+    local CURRENT_DNS
+    CURRENT_DNS=$(resolvectl dns "$IFACE" 2>/dev/null || echo "")
     
     # 检查是否包含我们的目标DNS服务器
     if echo "$CURRENT_DNS" | grep -qw "$TARGET_IPV4" && echo "$CURRENT_DNS" | grep -qw "$TARGET_IPV6"; then

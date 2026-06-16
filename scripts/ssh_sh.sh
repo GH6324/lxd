@@ -17,6 +17,7 @@ if [ "$(id -u)" -ne 0 ]; then
   echo "This script must be executed with root privileges."
   exit 1
 fi
+os_id=$(grep -E '^ID=' /etc/os-release 2>/dev/null | cut -d '=' -f 2 | tr -d '"' | tr '[:upper:]' '[:lower:]')
 config_dir="/etc/ssh/sshd_config.d/"
 for file in "$config_dir"*
 do
@@ -27,7 +28,7 @@ do
         fi
     fi
 done
-if [ "$(cat /etc/os-release | grep -E '^ID=' | cut -d '=' -f 2 | tr -d '"')" == "alpine" ]; then
+if [ "$os_id" = "alpine" ]; then
   apk update
   apk add --no-cache openssh-server
   apk add --no-cache sshpass
@@ -37,7 +38,7 @@ if [ "$(cat /etc/os-release | grep -E '^ID=' | cut -d '=' -f 2 | tr -d '"')" == 
   apk add --no-cache wget
   apk add --no-cache cronie
   apk add --no-cache cron
-  cd /etc/ssh
+  cd /etc/ssh || exit 1
   ssh-keygen -A
   chattr -i /etc/ssh/sshd_config
   sed -i '/^#PermitRootLogin\|PermitRootLogin/c PermitRootLogin yes' /etc/ssh/sshd_config
@@ -48,14 +49,16 @@ if [ "$(cat /etc/os-release | grep -E '^ID=' | cut -d '=' -f 2 | tr -d '"')" == 
   sed -i "s/^#\?\(Port\).*/\1 22/" /etc/ssh/sshd_config
   sed_compatible -i 's/^#?(Port).*/\1 22/' /etc/ssh/sshd_config
   sed -i '/^#UsePAM\|UsePAM/c #UsePAM no' /etc/ssh/sshd_config
-  sed_compatible -i 's/preserve_hostname:[[:space:]]*false/preserve_hostname: true/g' /etc/cloud/cloud.cfg
-  sed_compatible -i 's/disable_root:[[:space:]]*true/disable_root: false/g' /etc/cloud/cloud.cfg
-  sed_compatible -i 's/ssh_pwauth:[[:space:]]*false/ssh_pwauth:   true/g' /etc/cloud/cloud.cfg
+  if [ -f /etc/cloud/cloud.cfg ]; then
+    sed_compatible -i 's/preserve_hostname:[[:space:]]*false/preserve_hostname: true/g' /etc/cloud/cloud.cfg
+    sed_compatible -i 's/disable_root:[[:space:]]*true/disable_root: false/g' /etc/cloud/cloud.cfg
+    sed_compatible -i 's/ssh_pwauth:[[:space:]]*false/ssh_pwauth:   true/g' /etc/cloud/cloud.cfg
+  fi
   /usr/sbin/sshd
   rc-update add sshd default
-  echo root:"$1" | chpasswd root
+  printf 'root:%s\n' "$1" | chpasswd
   chattr +i /etc/ssh/sshd_config
-elif [ "$(cat /etc/os-release | grep -E '^ID=' | cut -d '=' -f 2 | tr -d '"')" == "openwrt" ]; then
+elif [ "$os_id" = "openwrt" ]; then
   opkg update
   opkg install openssh-server
   opkg install bash
@@ -66,7 +69,7 @@ elif [ "$(cat /etc/os-release | grep -E '^ID=' | cut -d '=' -f 2 | tr -d '"')" =
   opkg install cron
   /etc/init.d/sshd enable
   /etc/init.d/sshd start
-  cd /etc/ssh
+  cd /etc/ssh || exit 1
   ssh-keygen -A
   chattr -i /etc/ssh/sshd_config
   sed -i "s/^#\?Port.*/Port 22/g" /etc/ssh/sshd_config
@@ -79,7 +82,7 @@ elif [ "$(cat /etc/os-release | grep -E '^ID=' | cut -d '=' -f 2 | tr -d '"')" =
   sed -i "s/^#\?PubkeyAuthentication.*/PubkeyAuthentication no/g" /etc/ssh/sshd_config
   sed -i '/^AuthorizedKeysFile/s/^/#/' /etc/ssh/sshd_config
   chattr +i /etc/ssh/sshd_config
-  echo -e "$1\n$1" | passwd root
+  printf '%s\n%s\n' "$1" "$1" | passwd root
   /etc/init.d/sshd restart
 fi
 if [ -f "/etc/motd" ]; then

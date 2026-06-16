@@ -94,10 +94,10 @@ service_manager() {
 }
 
 # 输出颜色函数
-_red() { echo -e "\033[31m\033[01m$@\033[0m"; }
-_green() { echo -e "\033[32m\033[01m$@\033[0m"; }
-_yellow() { echo -e "\033[33m\033[01m$@\033[0m"; }
-_blue() { echo -e "\033[36m\033[01m$@\033[0m"; }
+_red() { printf '\033[31m\033[01m%s\033[0m\n' "$*"; }
+_green() { printf '\033[32m\033[01m%s\033[0m\n' "$*"; }
+_yellow() { printf '\033[33m\033[01m%s\033[0m\n' "$*"; }
+_blue() { printf '\033[36m\033[01m%s\033[0m\n' "$*"; }
 
 # 设置UTF-8环境
 setup_locale() {
@@ -115,17 +115,42 @@ setup_locale() {
 # 安装依赖包
 install_package() {
     package_name=$1
-    if command -v $package_name >/dev/null 2>&1; then
+    if command -v "$package_name" >/dev/null 2>&1; then
         _green "$package_name has been installed"
         _green "$package_name 已经安装"
     else
-        apt-get install -y $package_name
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "$package_name"
         if [ $? -ne 0 ]; then
-            apt-get install -y $package_name --fix-missing
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "$package_name" --fix-missing
         fi
         _green "$package_name has attempted to install"
         _green "$package_name 已尝试安装"
     fi
+}
+
+append_cron_once() {
+    local cron_line=$1
+    if ! crontab -l 2>/dev/null | grep -Fqx "$cron_line"; then
+        (crontab -l 2>/dev/null; printf '%s\n' "$cron_line") | crontab -
+    fi
+}
+
+get_physical_interface() {
+    local iface=""
+    if command -v lshw >/dev/null 2>&1; then
+        iface=$(lshw -C network 2>/dev/null | awk '/logical name:/{print $3}' | head -n 1)
+    fi
+    if [ -z "$iface" ]; then
+        local iface_path candidate
+        for iface_path in /sys/class/net/*; do
+            [ -e "$iface_path" ] || continue
+            candidate=$(basename "$iface_path")
+            [ -e "/sys/devices/virtual/net/$candidate" ] && continue
+            iface="$candidate"
+            break
+        done
+    fi
+    printf '%s\n' "$iface"
 }
 
 # 检查IPv6地址是否为私有地址
@@ -184,7 +209,7 @@ check_ipv6() {
             sleep 1
         done
     fi
-    echo $IPV6 >/usr/local/bin/lxd_check_ipv6
+    echo "$IPV6" >/usr/local/bin/lxd_check_ipv6
 }
 
 # 更新系统配置参数
@@ -235,7 +260,7 @@ wait_for_container_status() {
     timeout=$3
     interval=3
     elapsed_time=0
-    while [ $elapsed_time -lt $timeout ]; do
+    while [ "$elapsed_time" -lt "$timeout" ]; do
         status=$(lxc info "$container_name" | grep "Status: $target_status")
         if [[ "$status" == *"$target_status"* ]]; then
             return 0
@@ -257,10 +282,10 @@ setup_network_device_mapping() {
     IPV6=$(cat /usr/local/bin/lxd_check_ipv6)
     if ip -f inet6 addr | grep -q "he-ipv6"; then
         ipv6_network_name="he-ipv6"
-        ip_network_gam=$(ip -6 addr show ${ipv6_network_name} | grep -E "${IPV6}/24|${IPV6}/48|${IPV6}/64|${IPV6}/80|${IPV6}/96|${IPV6}/112" | grep global | awk '{print $2}' 2>/dev/null)
+        ip_network_gam=$(ip -6 addr show "$ipv6_network_name" | grep -E "${IPV6}/24|${IPV6}/48|${IPV6}/64|${IPV6}/80|${IPV6}/96|${IPV6}/112" | grep global | awk '{print $2}' 2>/dev/null)
     else
-        ipv6_network_name=$(ls /sys/class/net/ | grep -v "$(ls /sys/devices/virtual/net/)")
-        ip_network_gam=$(ip -6 addr show ${ipv6_network_name} | grep global | awk '{print $2}' | head -n 1)
+        ipv6_network_name=$(get_physical_interface)
+        ip_network_gam=$(ip -6 addr show "$ipv6_network_name" | grep global | awk '{print $2}' | head -n 1)
     fi
     _yellow "Local IPV6 address: $ip_network_gam"
     if [ -n "$ip_network_gam" ]; then
@@ -303,37 +328,42 @@ print(':'.join(parts[:7]) + ':')
         lxc stop "$CONTAINER_NAME"
         sleep 3
         wait_for_container_status "$CONTAINER_NAME" "STOPPED" 24
-        lxc config device add "$CONTAINER_NAME" eth1 nic nictype=routed parent=${ipv6_network_name} ipv6.address=${lxc_ipv6}
+        lxc config device remove "$CONTAINER_NAME" eth1 2>/dev/null || true
+        if ! lxc config device add "$CONTAINER_NAME" eth1 nic nictype=routed parent="$ipv6_network_name" ipv6.address="$lxc_ipv6"; then
+            _red "Failed to add routed IPv6 device for $CONTAINER_NAME"
+            _red "为 $CONTAINER_NAME 添加 routed IPv6 设备失败"
+            return 1
+        fi
         sleep 3
         lxc start "$CONTAINER_NAME"
         handle_fe80_gateway
         setup_ipv6_cron
         echo "$lxc_ipv6" >>"$CONTAINER_NAME"_v6
+    else
+        _red "No host IPv6 network address found for routed mapping"
+        _red "未找到宿主机 IPv6 网络地址，无法使用 routed 方式映射"
+        return 1
     fi
 }
 
 # 处理fe80网关
 handle_fe80_gateway() {
     if [[ "${ipv6_gateway_fe80}" == "N" ]]; then
-        inter=$(ls /sys/class/net/ | grep -v "$(ls /sys/devices/virtual/net/)")
-        del_ip=$(ip -6 addr show dev ${inter} | awk '/inet6 fe80/ {print $2}')
+        inter=$(get_physical_interface)
+        del_ip=$(ip -6 addr show dev "$inter" | awk '/inet6 fe80/ {print $2}')
         if [ -n "$del_ip" ]; then
-            ip addr del ${del_ip} dev ${inter}
+            ip addr del "$del_ip" dev "$inter"
             echo '#!/bin/bash' >/usr/local/bin/remove_route.sh
             echo "ip addr del ${del_ip} dev ${inter}" >>/usr/local/bin/remove_route.sh
             chmod 777 /usr/local/bin/remove_route.sh
-            if ! crontab -l | grep -q '/usr/local/bin/remove_route.sh' &>/dev/null; then
-                echo '@reboot /usr/local/bin/remove_route.sh' | crontab -
-            fi
+            append_cron_once '@reboot /usr/local/bin/remove_route.sh'
         fi
     fi
 }
 
 # 设置IPv6相关的定时任务
 setup_ipv6_cron() {
-    if ! crontab -l | grep -q '*/1 * * * * curl -m 6 -s ipv6.ip.sb && curl -m 6 -s ipv6.ip.sb'; then
-        echo '*/1 * * * * curl -m 6 -s ipv6.ip.sb && curl -m 6 -s ipv6.ip.sb' | crontab -
-    fi
+    append_cron_once '*/1 * * * * curl -m 6 -s ipv6.ip.sb && curl -m 6 -s ipv6.ip.sb'
 }
 
 # 使用nft/ipt映射IPv6
@@ -352,14 +382,14 @@ setup_nft_mapping() {
     local found_ipv6=""
     for ((i=3; i<=65535; i++)); do
         IPV6="${SUBNET_PREFIX}$(printf '%x' $i)"
-        if [[ $IPV6 == $CONTAINER_IPV6 ]]; then
+        if [[ $IPV6 == "$CONTAINER_IPV6" ]]; then
             continue
         fi
-        if ip -6 addr show dev "$interface" | grep -q $IPV6; then
+        if ip -6 addr show dev "$interface" | grep -q "$IPV6"; then
             continue
         fi
-        if ! ping6 -c1 -w1 -q $IPV6 &>/dev/null; then
-            if ! nft list ruleset 2>/dev/null | grep -q "dnat ip6 to $CONTAINER_IPV6.*$IPV6"; then
+        if ! ping6 -c1 -w1 -q "$IPV6" &>/dev/null; then
+            if ! nft list ruleset 2>/dev/null | grep -F "ip6 daddr $IPV6" | grep -Fq "dnat to $CONTAINER_IPV6"; then
                 _green "$IPV6"
                 found_ipv6="$IPV6"
                 break
@@ -395,14 +425,14 @@ setup_ipt_mapping() {
     local found_ipv6=""
     for ((i=3; i<=65535; i++)); do
         IPV6="${SUBNET_PREFIX}$(printf '%x' $i)"
-        if [[ $IPV6 == $CONTAINER_IPV6 ]]; then
+        if [[ $IPV6 == "$CONTAINER_IPV6" ]]; then
             continue
         fi
-        if ip -6 addr show dev "$interface" | grep -q $IPV6; then
+        if ip -6 addr show dev "$interface" | grep -q "$IPV6"; then
             continue
         fi
-        if ! ping6 -c1 -w1 -q $IPV6 &>/dev/null; then
-            if ! ip6tables -t nat -C PREROUTING -d $IPV6 -j DNAT --to-destination $CONTAINER_IPV6 &>/dev/null; then
+        if ! ping6 -c1 -w1 -q "$IPV6" &>/dev/null; then
+            if ! ip6tables -t nat -C PREROUTING -d "$IPV6" -j DNAT --to-destination "$CONTAINER_IPV6" &>/dev/null; then
                 _green "$IPV6"
                 found_ipv6="$IPV6"
                 break
@@ -419,8 +449,8 @@ setup_ipt_mapping() {
     IPV6="$found_ipv6"
     # 映射 IPV6 地址到容器的私有 IPV6 地址
     ip addr add "$IPV6"/"$ipv6_length" dev "$interface"
-    ip6tables -t nat -A PREROUTING -d $IPV6 -j DNAT --to-destination $CONTAINER_IPV6
-    ip6tables -t nat -A POSTROUTING -s $CONTAINER_IPV6 -j SNAT --to-source $IPV6
+    ip6tables -t nat -A PREROUTING -d "$IPV6" -j DNAT --to-destination "$CONTAINER_IPV6"
+    ip6tables -t nat -A POSTROUTING -s "$CONTAINER_IPV6" -j SNAT --to-source "$IPV6"
     # 设置持久化服务
     setup_persistence_service
     # 保存iptables规则
@@ -434,7 +464,8 @@ setup_ipt_mapping() {
 # 检测CDN
 check_cdn() {
     local o_url=$1
-    local shuffled_cdn_urls=($(shuf -e "${cdn_urls[@]}")) # 打乱数组顺序
+    local shuffled_cdn_urls=()
+    mapfile -t shuffled_cdn_urls < <(printf '%s\n' "${cdn_urls[@]}" | shuf)
     for cdn_url in "${shuffled_cdn_urls[@]}"; do
         if curl -4 -sL -k "$cdn_url$o_url" --max-time 6 | grep -q "success" >/dev/null 2>&1; then
             export cdn_success_url="$cdn_url"
@@ -465,13 +496,21 @@ check_cdn_file() {
 # 设置持久化服务
 setup_persistence_service() {
     if [ ! -f /usr/local/bin/add-ipv6.sh ]; then
-        wget ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/add-ipv6.sh -O /usr/local/bin/add-ipv6.sh
+        if ! wget "${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/add-ipv6.sh" -O /usr/local/bin/add-ipv6.sh; then
+            _red "Failed to download add-ipv6.sh"
+            _red "下载 add-ipv6.sh 失败"
+            exit 1
+        fi
         chmod +x /usr/local/bin/add-ipv6.sh
     else
         echo "Script already exists. Skipping installation."
     fi
     if [ ! -f /etc/systemd/system/add-ipv6.service ]; then
-        wget ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/add-ipv6.service -O /etc/systemd/system/add-ipv6.service
+        if ! wget "${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/add-ipv6.service" -O /etc/systemd/system/add-ipv6.service; then
+            _red "Failed to download add-ipv6.service"
+            _red "下载 add-ipv6.service 失败"
+            exit 1
+        fi
         chmod +x /etc/systemd/system/add-ipv6.service
         service_manager daemon-reload
         service_manager enable add-ipv6.service
@@ -489,7 +528,7 @@ save_iptables_rules() {
 # 测试IPv6连通性
 test_ipv6_connectivity() {
     local ipv6_addr=$1
-    if ping6 -c 3 $ipv6_addr &>/dev/null; then
+    if ping6 -c 3 "$ipv6_addr" &>/dev/null; then
         _green "$CONTAINER_NAME The external IPV6 address of the container is $ipv6_addr"
         _green "$CONTAINER_NAME 容器的外网IPV6地址为 $ipv6_addr"
     else
@@ -514,13 +553,18 @@ main() {
     install_package net-tools
     install_package cron
     # 查询网卡
-    interface=$(lshw -C network | awk '/logical name:/{print $3}' | head -1)
+    interface=$(get_physical_interface)
+    if [ -z "$interface" ]; then
+        _red "No physical network interface found"
+        _red "未找到物理网卡"
+        exit 1
+    fi
     _yellow "NIC $interface"
     _yellow "网卡 $interface"
     # 等待容器运行
     wait_for_container_status "$CONTAINER_NAME" "RUNNING" 24
     # 获取指定LXC容器的内网IPV6
-    CONTAINER_IPV6=$(lxc list $CONTAINER_NAME --format=json | jq -r '.[0].state.network.eth0.addresses[] | select(.family=="inet6") | select(.scope=="global") | .address')
+    CONTAINER_IPV6=$(lxc list "$CONTAINER_NAME" --format=json | jq -r '.[0].state.network.eth0.addresses[] | select(.family=="inet6") | select(.scope=="global") | .address')
     if [ -z "$CONTAINER_IPV6" ]; then
         _red "Container has no intranet IPV6 address, no auto-mapping"
         _red "容器无内网IPV6地址，不进行自动映射"
@@ -569,9 +613,9 @@ print(':'.join(parts[:7]) + ':')
     output=$(ip -6 route show | awk '/default via/{print $3}')
     num_lines=$(echo "$output" | wc -l)
     ipv6_gateway=""
-    if [ $num_lines -eq 1 ]; then
+    if [ "$num_lines" -eq 1 ]; then
         ipv6_gateway="$output"
-    elif [ $num_lines -ge 2 ]; then
+    elif [ "$num_lines" -ge 2 ]; then
         non_fe80_lines=$(echo "$output" | grep -v '^fe80')
         if [ -n "$non_fe80_lines" ]; then
             ipv6_gateway=$(echo "$non_fe80_lines" | head -n 1)
@@ -595,7 +639,7 @@ print(':'.join(parts[:7]) + ':')
     _blue "宿主机的IPV6子网前缀为 $SUBNET_PREFIX"
     # 根据选项决定映射方式
     if [[ $use_iptables == n ]]; then
-        setup_network_device_mapping
+        setup_network_device_mapping || exit 1
     else
         cdn_urls=("https://cdn0.spiritlhl.top/" "http://cdn1.spiritlhl.net/" "http://cdn2.spiritlhl.net/" "http://cdn3.spiritlhl.net/" "http://cdn4.spiritlhl.net/")
         check_cdn_file

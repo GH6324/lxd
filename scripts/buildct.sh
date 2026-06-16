@@ -9,7 +9,7 @@
 
 # 初始化变量和依赖检查
 init_env() {
-    cd /root >/dev/null 2>&1
+    cd /root >/dev/null 2>&1 || exit 1
     if ! command -v jq >/dev/null 2>&1; then
         apt-get install jq -y
     fi
@@ -29,7 +29,8 @@ check_china() {
 # 检测CDN
 check_cdn() {
     local o_url=$1
-    local shuffled_cdn_urls=($(shuf -e "${cdn_urls[@]}")) # 打乱数组顺序
+    local shuffled_cdn_urls=()
+    mapfile -t shuffled_cdn_urls < <(printf '%s\n' "${cdn_urls[@]}" | shuf)
     for cdn_url in "${shuffled_cdn_urls[@]}"; do
         if curl -4 -sL -k "$cdn_url$o_url" --max-time 6 | grep -q "success" >/dev/null 2>&1; then
             export cdn_success_url="$cdn_url"
@@ -59,15 +60,38 @@ check_cdn_file() {
 
 # 获取系统架构
 get_system_arch() {
+    sys_bit=""
+    sys_bit_alt=""
+    self_image_arch=""
     sysarch="$(uname -m)"
     case "${sysarch}" in
-    "x86_64" | "x86" | "amd64" | "x64") sys_bit="x86_64" ;;
-    "i386" | "i686") sys_bit="i686" ;;
-    "aarch64" | "armv8" | "armv8l") sys_bit="aarch64" ;;
-    "armv7l") sys_bit="armv7l" ;;
+    "x86_64" | "x86" | "amd64" | "x64")
+        sys_bit="x86_64"
+        sys_bit_alt="amd64"
+        self_image_arch="x86_64"
+        ;;
+    "i386" | "i686")
+        sys_bit="i686"
+        sys_bit_alt="i386"
+        self_image_arch=""
+        ;;
+    "aarch64" | "armv8" | "armv8l")
+        sys_bit="aarch64"
+        sys_bit_alt="arm64"
+        self_image_arch="arm64"
+        ;;
+    "armv7l")
+        sys_bit="armv7l"
+        sys_bit_alt="armhf"
+        self_image_arch=""
+        ;;
     "s390x") sys_bit="s390x" ;;
     "ppc64le") sys_bit="ppc64le" ;;
-    *) sys_bit="x86_64" ;;
+    *)
+        sys_bit="x86_64"
+        sys_bit_alt="amd64"
+        self_image_arch="x86_64"
+        ;;
     esac
 }
 
@@ -91,7 +115,16 @@ validate_positive_port() {
     validate_positive_int "$1" && [ "$1" -le 65535 ]
 }
 
+validate_instance_name() {
+    [ -n "$1" ] && [ "$1" != "." ] && [ "$1" != ".." ] && [[ "$1" != -* ]] && [[ "$1" != */* ]]
+}
+
 validate_inputs() {
+    if ! validate_instance_name "$name"; then
+        echo "Error: container name must not be empty, start with '-', or contain '/'."
+        echo "错误：容器名称不能为空，不能以 '-' 开头，也不能包含 '/'。"
+        exit 1
+    fi
     if ! validate_positive_int "$cpu" || ! validate_positive_int "$memory" || ! validate_positive_int "$in" || ! validate_positive_int "$out"; then
         echo "Error: CPU, memory and speed values must be positive integers."
         echo "错误：CPU、内存和网速参数必须是正整数。"
@@ -119,15 +152,140 @@ validate_inputs() {
     fi
 }
 
+replace_proxy_device() {
+    local device_name="$1"
+    shift
+    lxc config device remove "$name" "$device_name" 2>/dev/null || true
+    lxc config device add "$name" "$device_name" proxy "$@"
+}
+
+remove_device_if_exists() {
+    local device_name="$1"
+    lxc config device remove "$name" "$device_name" 2>/dev/null || true
+}
+
+ensure_container_ipv6_cron() {
+    # shellcheck disable=SC2016
+    lxc exec "$name" -- sh -c 'cron_line="*/1 * * * * curl -m 6 -s ipv6.ip.sb && curl -m 6 -s ipv6.ip.sb"; if ! crontab -l 2>/dev/null | grep -Fqx "$cron_line"; then (crontab -l 2>/dev/null; printf "%s\n" "$cron_line") | crontab -; fi'
+}
+
+download_host_file() {
+    local url="$1"
+    local output="$2"
+    if ! curl -fsSLk "${cdn_success_url}${url}" -o "$output"; then
+        echo "Failed to download: $url"
+        echo "下载失败：$url"
+        exit 1
+    fi
+}
+
+strip_image_separators() {
+    local value="$1"
+    while [[ "$value" == [/:_.-]* ]]; do
+        value="${value#?}"
+    done
+    while [[ "$value" == *[/:_.-] ]]; do
+        value="${value%?}"
+    done
+    printf '%s\n' "$value"
+}
+
+canonical_image_family() {
+    local family="$1"
+    case "$family" in
+    alma) family="almalinux" ;;
+    rocky) family="rockylinux" ;;
+    oraclelinux | oracle-linux | oracle_linux) family="oracle" ;;
+    arch) family="archlinux" ;;
+    esac
+    printf '%s\n' "$family"
+}
+
+normalize_image_system() {
+    local raw="${1:-}"
+    local input prefix
+    input="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    input="${input#images:}"
+    input="${input#opsmaru:}"
+    input="$(strip_image_separators "$input")"
+    if [ -z "$input" ]; then
+        return 1
+    fi
+    if [[ "$input" == */* ]]; then
+        a="${input%%/*}"
+        b="${input#*/}"
+        b="${b%%/*}"
+    else
+        prefix="${input%%[0-9]*}"
+        if [ "$prefix" != "$input" ]; then
+            a="$prefix"
+            b="${input#"$prefix"}"
+        else
+            a="$input"
+            b=""
+        fi
+    fi
+    a="$(strip_image_separators "$a")"
+    b="$(strip_image_separators "$b")"
+    a="$(canonical_image_family "$a")"
+    normalized_system="${a}${b}"
+    [ -n "$a" ]
+}
+
+image_name_matches_system() {
+    local image_name="$1"
+    [ -n "${a:-}" ] || return 1
+    if [ -z "${b:-}" ]; then
+        [[ "$image_name" == "${a}_"* ]]
+        return
+    fi
+    [[ "$image_name" == "${a}_${b}"* ]]
+}
+
+find_matching_image_from_stream() {
+    local image_name
+    while IFS= read -r image_name; do
+        [ -n "$image_name" ] || continue
+        if image_name_matches_system "$image_name"; then
+            printf '%s\n' "$image_name"
+            return 0
+        fi
+    done
+    return 1
+}
+
+remote_image_query() {
+    if [ -n "${b:-}" ]; then
+        printf '%s/%s\n' "$a" "$b"
+    else
+        printf '%s\n' "$a"
+    fi
+}
+
+find_remote_image_alias() {
+    local remote="$1"
+    local image_type="$2"
+    local query
+    command -v lxc >/dev/null 2>&1 || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    query="$(remote_image_query)"
+    lxc image list "${remote}:${query}" --format=json 2>/dev/null | jq -r --arg ARCHITECTURE "${sys_bit:-}" --arg ARCHITECTURE_ALT "${sys_bit_alt:-}" --arg IMAGE_TYPE "$image_type" '
+        .[]?
+        | select((.type // "") == $IMAGE_TYPE)
+        | select($ARCHITECTURE == "" or (.architecture // "") == $ARCHITECTURE or ($ARCHITECTURE_ALT != "" and (.architecture // "") == $ARCHITECTURE_ALT))
+        | .aliases[]?
+        | .name // empty
+        | select(length > 0)
+    ' | head -n 1
+}
+
 # 处理镜像
 process_image() {
     image_download_url=""
     fixed_system=false
     status_tuna=false
-    if [[ "$sys_bit" == "x86_64" || "$sys_bit" == "aarch64" ]]; then
+    if [ -n "${self_image_arch:-}" ]; then
         process_self_fixed_images
-    else
-        output=$(lxc image list images:${a}/${b})
     fi
 
     if [ -z "$image_download_url" ]; then
@@ -141,20 +299,11 @@ process_image() {
 
 # 处理自定义镜像
 process_self_fixed_images() {
-    self_fixed_images=($(curl -slk -m 6 ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd_images/main/${sys_bit}_all_images.txt))
-    for image_name in "${self_fixed_images[@]}"; do
-        if [ -z "${b}" ]; then
-            if [[ "$image_name" == "${a}"* ]]; then
-                use_fixed_image "$image_name"
-                break
-            fi
-        else
-            if [[ "$image_name" == "${a}_${b}"* ]]; then
-                use_fixed_image "$image_name"
-                break
-            fi
-        fi
-    done
+    local matched_image
+    matched_image=$(curl -fsSLk -m 10 "${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd_images/main/${self_image_arch}_all_images.txt" 2>/dev/null | find_matching_image_from_stream)
+    if [ -n "$matched_image" ]; then
+        use_fixed_image "$matched_image"
+    fi
 }
 
 # 使用固定镜像
@@ -164,12 +313,26 @@ use_fixed_image() {
     image_download_url="https://github.com/oneclickvirt/lxd_images/releases/download/${a}/${image_name}"
     image_alias_output=$(lxc image alias list)
     if [[ "$image_alias_output" != *"$image_name"* ]]; then
-        wget "${cdn_success_url}${image_download_url}"
+        if ! wget "${cdn_success_url}${image_download_url}"; then
+            echo "Failed to download image: ${image_download_url}"
+            echo "镜像下载失败：${image_download_url}"
+            exit 1
+        fi
         chmod 777 "$image_name"
-        unzip "$image_name"
-        rm -rf "$image_name"
-        lxc image import lxd.tar.xz rootfs.squashfs --alias "$image_name"
-        rm -rf lxd.tar.xz rootfs.squashfs
+        if ! unzip "$image_name"; then
+            rm -f -- "$image_name"
+            echo "Failed to unzip image: ${image_name}"
+            echo "镜像解压失败：${image_name}"
+            exit 1
+        fi
+        rm -f -- "$image_name"
+        if ! lxc image import lxd.tar.xz rootfs.squashfs --alias "$image_name"; then
+            rm -f -- lxd.tar.xz rootfs.squashfs
+            echo "Failed to import image: ${image_name}"
+            echo "镜像导入失败：${image_name}"
+            exit 1
+        fi
+        rm -f -- lxd.tar.xz rootfs.squashfs
         echo "A matching image exists and will be created using ${image_download_url}"
         echo "匹配的镜像存在，将使用 ${image_download_url} 进行创建"
     fi
@@ -177,7 +340,7 @@ use_fixed_image() {
 
 # 处理images仓库
 process_images_repository() {
-    system=$(lxc image list images:${a}/${b} --format=json | jq -r --arg ARCHITECTURE "$sys_bit" '.[] | select(.type == "container" and .architecture == $ARCHITECTURE) | .aliases[0].name' | head -n 1)
+    system="$(find_remote_image_alias images container)"
     if [ -n "$system" ]; then
         echo "A matching image exists and will be created using images:${system}"
         echo "匹配的镜像存在，将使用 images:${system} 进行创建"
@@ -187,18 +350,14 @@ process_images_repository() {
 
 # 处理opsmaru仓库
 process_opsmaru_repository() {
-    system=$(lxc image list opsmaru:${a}/${b} --format=json | jq -r --arg ARCHITECTURE "$sys_bit" '.[] | select(.type == "container" and .architecture == $ARCHITECTURE) | .aliases[0].name' | head -n 1)
-    if [ $? -ne 0 ]; then
-        status_tuna=false
+    system="$(find_remote_image_alias opsmaru container)"
+    if [ -n "$system" ]; then
+        echo "A matching image exists and will be created using opsmaru:${system}"
+        echo "匹配的镜像存在，将使用 opsmaru:${system} 进行创建"
+        status_tuna=true
+        fixed_system=false
     else
-        if echo "$system" | grep -q "${a}"; then
-            echo "A matching image exists and will be created using opsmaru:${system}"
-            echo "匹配的镜像存在，将使用 opsmaru:${system} 进行创建"
-            status_tuna=true
-            fixed_system=false
-        else
-            status_tuna=false
-        fi
+        status_tuna=false
     fi
     if [ "$status_tuna" = false ]; then
         echo "No matching image found, please execute"
@@ -213,23 +372,23 @@ process_opsmaru_repository() {
 
 # 创建容器
 create_container() {
-    rm -rf "$name"
+    rm -f -- "$name"
     # 计算硬盘大小参数
     if [[ $disk == *.* ]]; then
         # 小数硬盘大小，转换为 MiB
         disk_mb=$(awk -v disk="$disk" 'BEGIN { mb = int(disk * 1024); if (mb < 1) mb = 1; printf "%d", mb }')
-        disk_param="-d root,size=${disk_mb}MiB"
+        disk_param=(-d "root,size=${disk_mb}MiB")
     else
         # 整数硬盘大小，使用 GiB
-        disk_param="-d root,size=${disk}GiB"
+        disk_param=(-d "root,size=${disk}GiB")
     fi
     
     if [ -z "$image_download_url" ] && [ "$status_tuna" = true ]; then
-        lxc init opsmaru:${system} "$name" -c limits.cpu="$cpu" -c limits.memory="$memory"MiB $disk_param -s default
+        lxc init "opsmaru:${system}" "$name" -c limits.cpu="$cpu" -c limits.memory="$memory"MiB "${disk_param[@]}" -s default
     elif [ -z "$image_download_url" ]; then
-        lxc init images:${system} "$name" -c limits.cpu="$cpu" -c limits.memory="$memory"MiB $disk_param -s default
+        lxc init "images:${system}" "$name" -c limits.cpu="$cpu" -c limits.memory="$memory"MiB "${disk_param[@]}" -s default
     else
-        lxc init "$image_name" "$name" -c limits.cpu="$cpu" -c limits.memory="$memory"MiB $disk_param -s default
+        lxc init "$image_name" "$name" -c limits.cpu="$cpu" -c limits.memory="$memory"MiB "${disk_param[@]}" -s default
     fi
     if [ $? -ne 0 ]; then
         echo "Container creation failed, please check the previous output message"
@@ -300,7 +459,7 @@ setup_mirrors() {
         lxc exec "$name" -- curl -lk https://gitee.com/SuperManito/LinuxMirrors/raw/main/ChangeMirrors.sh -o ChangeMirrors.sh
         lxc exec "$name" -- chmod 777 ChangeMirrors.sh
         lxc exec "$name" -- ./ChangeMirrors.sh --source mirrors.tuna.tsinghua.edu.cn --web-protocol http --intranet false --backup true --updata-software false --clean-cache false --ignore-backup-tips
-        lxc exec "$name" -- rm -rf ChangeMirrors.sh
+        lxc exec "$name" -- rm -f -- ChangeMirrors.sh
     fi
 }
 
@@ -339,20 +498,20 @@ setup_ssh() {
 # 配置Alpine和OpenWrt的SSH
 setup_ssh_sh() {
     if [ ! -f /usr/local/bin/ssh_sh.sh ]; then
-        curl -L ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_sh.sh -o /usr/local/bin/ssh_sh.sh
+        download_host_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_sh.sh" /usr/local/bin/ssh_sh.sh
         chmod 777 /usr/local/bin/ssh_sh.sh
         dos2unix /usr/local/bin/ssh_sh.sh
     fi
     cp /usr/local/bin/ssh_sh.sh /root
     lxc file push /root/ssh_sh.sh "$name"/root/
     lxc exec "$name" -- chmod 777 ssh_sh.sh
-    lxc exec "$name" -- ./ssh_sh.sh ${passwd}
+    lxc exec "$name" -- ./ssh_sh.sh "$passwd"
 }
 
 # 配置其他系统的SSH
 setup_ssh_bash() {
     if [ ! -f /usr/local/bin/ssh_bash.sh ]; then
-        curl -L ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_bash.sh -o /usr/local/bin/ssh_bash.sh
+        download_host_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_bash.sh" /usr/local/bin/ssh_bash.sh
         chmod 777 /usr/local/bin/ssh_bash.sh
         dos2unix /usr/local/bin/ssh_bash.sh
     fi
@@ -360,9 +519,9 @@ setup_ssh_bash() {
     lxc file push /root/ssh_bash.sh "$name"/root/
     lxc exec "$name" -- chmod 777 ssh_bash.sh
     lxc exec "$name" -- dos2unix ssh_bash.sh
-    lxc exec "$name" -- sudo ./ssh_bash.sh $passwd
+    lxc exec "$name" -- sudo ./ssh_bash.sh "$passwd"
     if [ ! -f /usr/local/bin/config.sh ]; then
-        curl -L ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/config.sh -o /usr/local/bin/config.sh
+        download_host_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/config.sh" /usr/local/bin/config.sh
         chmod 777 /usr/local/bin/config.sh
         dos2unix /usr/local/bin/config.sh
     fi
@@ -404,10 +563,13 @@ configure_port() {
             exit 1
         fi
     fi
-    lxc config device add "$name" ssh-port proxy listen=tcp:$ipv4_address:$sshn connect=tcp:$container_ip:22 nat=true
+    replace_proxy_device ssh-port "listen=tcp:$ipv4_address:$sshn" "connect=tcp:$container_ip:22" nat=true
     if [ "$nat1" != "0" ] && [ "$nat2" != "0" ]; then
-        lxc config device add "$name" nattcp-ports proxy listen=tcp:$ipv4_address:$nat1-$nat2 connect=tcp:0.0.0.0:$nat1-$nat2 nat=true
-        lxc config device add "$name" natudp-ports proxy listen=udp:$ipv4_address:$nat1-$nat2 connect=udp:0.0.0.0:$nat1-$nat2 nat=true
+        replace_proxy_device nattcp-ports "listen=tcp:$ipv4_address:$nat1-$nat2" "connect=tcp:0.0.0.0:$nat1-$nat2" nat=true
+        replace_proxy_device natudp-ports "listen=udp:$ipv4_address:$nat1-$nat2" "connect=udp:0.0.0.0:$nat1-$nat2" nat=true
+    else
+        remove_device_if_exists nattcp-ports
+        remove_device_if_exists natudp-ports
     fi
 }
 
@@ -415,10 +577,10 @@ configure_port() {
 configure_ipv6() {
     if [ -n "$enable_ipv6" ]; then
         if [ "$enable_ipv6" == "y" ]; then
-            lxc exec "$name" -- sh -c 'echo "*/1 * * * * curl -m 6 -s ipv6.ip.sb && curl -m 6 -s ipv6.ip.sb" | crontab -'
+            ensure_container_ipv6_cron
             sleep 1
             if [ ! -f "./build_ipv6_network.sh" ]; then
-                curl -L ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/build_ipv6_network.sh -o build_ipv6_network.sh
+                download_host_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/build_ipv6_network.sh" build_ipv6_network.sh
                 chmod +x build_ipv6_network.sh
             fi
             ./build_ipv6_network.sh "$name"
@@ -432,7 +594,7 @@ wait_for_container_ready_to_shutdown() {
     local max_wait=18
     local check_interval=6
     local waited=0
-    while [ $waited -lt $max_wait ]; do
+    while [ "$waited" -lt "$max_wait" ]; do
         if lxc exec "$name" -- pgrep -f "apt|yum|pacman|apk|opkg" > /dev/null 2>&1; then
             echo "Container is executing package management operations, continuing to wait..."
             echo "容器正在执行包管理操作，继续等待..."
@@ -440,12 +602,12 @@ wait_for_container_ready_to_shutdown() {
             echo "Container is executing SSH configuration, continuing to wait..."
             echo "容器正在执行SSH配置，继续等待..."
         fi
-        sleep $check_interval
+        sleep "$check_interval"
         waited=$((waited + check_interval))
         echo "Waited ${waited} seconds..."
         echo "已等待 ${waited} 秒..."
     done
-    if [ $waited -ge $max_wait ]; then
+    if [ "$waited" -ge "$max_wait" ]; then
         echo "Wait timeout, forcing shutdown process..."
         echo "等待超时，强制继续关机流程..."
     fi
@@ -457,8 +619,9 @@ safe_shutdown_container() {
     lxc stop "$name" --timeout=30
     local max_shutdown_wait=30
     local waited=0
-    while [ $waited -lt $max_shutdown_wait ]; do
-        local container_status=$(lxc info "$name" | grep "Status:" | awk '{print $2}')
+    while [ "$waited" -lt "$max_shutdown_wait" ]; do
+        local container_status
+        container_status=$(lxc info "$name" | grep "Status:" | awk '{print $2}')
         if [ "$container_status" = "STOPPED" ]; then
             echo "Container has been safely stopped"
             echo "容器已安全停止"
@@ -489,7 +652,7 @@ configure_network_speed() {
 }
 
 cleanup_and_output() {
-    rm -rf ssh_bash.sh config.sh ssh_sh.sh
+    rm -f -- ssh_bash.sh config.sh ssh_sh.sh
     if echo "$system" | grep -qiE "alpine"; then
         sleep 3
         lxc stop "$name" --timeout=30
@@ -525,8 +688,12 @@ main() {
     enable_ipv6="${10:-N}"
     enable_ipv6=$(echo "$enable_ipv6" | tr '[:upper:]' '[:lower:]')
     system="${11:-debian12}"
-    a="${system%%[0-9]*}"
-    b="${system##*[!0-9.]}"
+    if ! normalize_image_system "$system"; then
+        echo "Error: system must be a valid image name, such as debian12 or debian/12."
+        echo "错误：系统名称必须有效，例如 debian12 或 debian/12。"
+        exit 1
+    fi
+    system="$normalized_system"
     validate_inputs
     get_system_arch
     process_image

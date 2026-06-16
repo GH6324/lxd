@@ -17,12 +17,12 @@
 #   noninteractive=true    跳过确认提示，直接执行卸载 / skip confirmation, uninstall directly
 #   REMOVE_STORAGE=true    同时删除存储后端文件（loop 镜像）/ also remove backing storage files
 
-cd /root >/dev/null 2>&1
+cd /root >/dev/null 2>&1 || exit 1
 
-_red() { echo -e "\033[31m\033[01m$@\033[0m"; }
-_green() { echo -e "\033[32m\033[01m$@\033[0m"; }
-_yellow() { echo -e "\033[33m\033[01m$@\033[0m"; }
-_blue() { echo -e "\033[36m\033[01m$@\033[0m"; }
+_red() { printf '\033[31m\033[01m%s\033[0m\n' "$*"; }
+_green() { printf '\033[32m\033[01m%s\033[0m\n' "$*"; }
+_yellow() { printf '\033[33m\033[01m%s\033[0m\n' "$*"; }
+_blue() { printf '\033[36m\033[01m%s\033[0m\n' "$*"; }
 reading() { read -rp "$(_green "$1")" "$2"; }
 
 is_true() {
@@ -39,6 +39,39 @@ if is_true "${REMOVE_STORAGE:-}"; then
 else
     REMOVE_STORAGE_UPPER="FALSE"
 fi
+
+remove_recorded_storage_files() {
+    local storage_dir="$1"
+    if [ -z "$storage_dir" ] || [ ! -d "$storage_dir" ]; then
+        return 0
+    fi
+    if [[ ! "$storage_dir" =~ ^/.+ ]] || [ "$storage_dir" = "/" ]; then
+        _yellow "  跳过异常自定义存储路径 / Skipping unsafe storage path: $storage_dir"
+        return 0
+    fi
+
+    local mount_point="$storage_dir/btrfs_mount"
+    if mountpoint -q "$mount_point" 2>/dev/null; then
+        _yellow "  卸载自定义 btrfs 挂载点 / Unmounting custom btrfs mount: $mount_point"
+        umount "$mount_point" 2>/dev/null || true
+    fi
+
+    local storage_file
+    for storage_file in \
+        "$storage_dir/btrfs_pool.img" \
+        "$storage_dir/lvm_pool.img" \
+        "$storage_dir/zfs_pool.img" \
+        "$storage_dir/lvm_loop_file.txt"; do
+        [ -f "$storage_file" ] && rm -f "$storage_file" && _yellow "  已删除 / Removed: $storage_file"
+    done
+
+    [ -d "$mount_point" ] && rmdir "$mount_point" 2>/dev/null || true
+    if rmdir "$storage_dir" 2>/dev/null; then
+        _yellow "  已删除空自定义存储目录 / Removed empty custom storage dir: $storage_dir"
+    else
+        _yellow "  自定义存储目录非空，已保留 / Custom storage dir not empty, kept: $storage_dir"
+    fi
+}
 
 # ─── 确认卸载 ────────────────────────────────────────────────────────────────
 if ! is_true "${noninteractive:-}"; then
@@ -99,8 +132,6 @@ _blue "[2/9] 清理 LXD 存储池 / Cleaning up LXD storage pools..."
 if command -v lxc >/dev/null 2>&1 || [ -x /snap/bin/lxc ]; then
     LXC_CMD="lxc"
     ! command -v lxc >/dev/null 2>&1 && LXC_CMD="/snap/bin/lxc"
-    LXD_CMD="/snap/bin/lxd"
-
     # 获取存储类型和路径
     storage_type=""
     if [ -f /usr/local/bin/lxd_storage_type ]; then
@@ -171,17 +202,10 @@ if command -v lxc >/dev/null 2>&1 || [ -x /snap/bin/lxc ]; then
             /data/lxd-storage/zfs_pool.img; do
             [ -f "$img" ] && rm -f "$img" && _yellow "  已删除 / Removed: $img"
         done
-        # 通过记录的自定义路径查找
+        # 通过记录的自定义路径查找。只删除本脚本创建的已知后端文件，不递归删除整个目录。
         if [ -f /usr/local/bin/lxd_storage_path ]; then
             sp=$(cat /usr/local/bin/lxd_storage_path 2>/dev/null)
-            if [ -n "$sp" ] && [ -d "$sp" ]; then
-                if [[ "$sp" =~ ^/.+ ]] && [ "$sp" != "/" ]; then
-                    _yellow "  删除自定义存储目录 / Removing custom storage dir: $sp"
-                    rm -rf "$sp" 2>/dev/null || true
-                else
-                    _yellow "  跳过异常自定义存储路径 / Skipping unsafe storage path: $sp"
-                fi
-            fi
+            remove_recorded_storage_files "$sp"
         fi
         _green "  存储后端文件已清理 / Backing storage files removed."
     fi
@@ -193,9 +217,11 @@ fi
 _blue "[3/9] 卸载 LXD snap / Removing LXD snap..."
 
 if command -v snap >/dev/null 2>&1; then
-    snap remove lxd 2>/dev/null && \
-        _green "  LXD snap 已卸载 / LXD snap removed." || \
+    if snap remove lxd 2>/dev/null; then
+        _green "  LXD snap 已卸载 / LXD snap removed."
+    else
         _yellow "  LXD snap 不存在或卸载失败 / LXD snap not found or failed to remove."
+    fi
 else
     _yellow "  snap 不可用，跳过 / snap not available, skipping."
 fi

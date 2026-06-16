@@ -22,7 +22,7 @@
 #   WITHOUTCDN=true            跳过 CDN 加速
 #   CN=true                    强制使用中国镜像
 
-cd /root >/dev/null 2>&1
+cd /root >/dev/null 2>&1 || exit 1
 REGEX=("debian|astra" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazon linux'" "fedora" "arch|manjaro" "alpine" "freebsd")
 RELEASE=("Debian" "Ubuntu" "CentOS" "CentOS" "Fedora" "Arch" "Alpine" "FreeBSD")
 CMD=("$(grep -i pretty_name /etc/os-release 2>/dev/null | cut -d \" -f2)" "$(hostnamectl 2>/dev/null | grep -i system | cut -d : -f2)" "$(lsb_release -sd 2>/dev/null)" "$(grep -i description /etc/lsb-release 2>/dev/null | cut -d \" -f2)" "$(grep . /etc/redhat-release 2>/dev/null)" "$(grep . /etc/issue 2>/dev/null | cut -d \\ -f1 | sed '/^[ ]*$/d')" "$(grep -i pretty_name /etc/os-release 2>/dev/null | cut -d \" -f2)" "$(uname -s)")
@@ -44,10 +44,10 @@ fi
 [ ! -f "$TRIED_STORAGE_FILE" ] && [ -f "$LEGACY_TRIED_STORAGE_FILE" ] && cp "$LEGACY_TRIED_STORAGE_FILE" "$TRIED_STORAGE_FILE"
 [ ! -f "$INSTALLED_STORAGE_FILE" ] && [ -f "$LEGACY_INSTALLED_STORAGE_FILE" ] && cp "$LEGACY_INSTALLED_STORAGE_FILE" "$INSTALLED_STORAGE_FILE"
 
-_red() { echo -e "\033[31m\033[01m$@\033[0m"; }
-_green() { echo -e "\033[32m\033[01m$@\033[0m"; }
-_yellow() { echo -e "\033[33m\033[01m$@\033[0m"; }
-_blue() { echo -e "\033[36m\033[01m$@\033[0m"; }
+_red() { printf '\033[31m\033[01m%s\033[0m\n' "$*"; }
+_green() { printf '\033[32m\033[01m%s\033[0m\n' "$*"; }
+_yellow() { printf '\033[33m\033[01m%s\033[0m\n' "$*"; }
+_blue() { printf '\033[36m\033[01m%s\033[0m\n' "$*"; }
 reading() { read -rp "$(_green "$1")" "$2"; }
 
 is_true() {
@@ -216,27 +216,27 @@ set_locale() {
 
 install_package() {
     package_name=$1
-    if command -v $package_name >/dev/null 2>&1; then
+    if command -v "$package_name" >/dev/null 2>&1; then
         _green "$package_name has been installed"
         _green "$package_name 已经安装"
     else
         if [ "$SYSTEM" = "Alpine" ] && command -v apk >/dev/null 2>&1; then
-            apk add --no-cache $package_name
+            apk add --no-cache "$package_name"
         elif [ "$SYSTEM" = "Arch" ] && command -v pacman >/dev/null 2>&1; then
-            pacman -S --noconfirm --needed $package_name
+            pacman -S --noconfirm --needed "$package_name"
         elif command -v apt-get >/dev/null 2>&1; then
-            apt-get install -y $package_name
+            apt-get install -y "$package_name"
             if [ $? -ne 0 ]; then
-                apt-get install -y $package_name --fix-missing
+                apt-get install -y "$package_name" --fix-missing
             fi
         elif command -v yum >/dev/null 2>&1; then
-            yum install -y $package_name
+            yum install -y "$package_name"
         elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y $package_name
+            dnf install -y "$package_name"
         elif command -v apk >/dev/null 2>&1; then
-            apk add --no-cache $package_name
+            apk add --no-cache "$package_name"
         elif command -v pacman >/dev/null 2>&1; then
-            pacman -S --noconfirm --needed $package_name
+            pacman -S --noconfirm --needed "$package_name"
         else
             _yellow "No supported package manager found"
             _yellow "未找到支持的包管理器"
@@ -249,7 +249,8 @@ install_package() {
 
 check_cdn() {
     local o_url=$1
-    local shuffled_cdn_urls=($(shuf -e "${cdn_urls[@]}"))
+    local shuffled_cdn_urls=()
+    mapfile -t shuffled_cdn_urls < <(printf '%s\n' "${cdn_urls[@]}" | shuf)
     for cdn_url in "${shuffled_cdn_urls[@]}"; do
         if curl -4 -sL -k "$cdn_url$o_url" --max-time 6 | grep -q "success" >/dev/null 2>&1; then
             export cdn_success_url="$cdn_url"
@@ -276,16 +277,28 @@ check_cdn_file() {
     fi
 }
 
+download_file() {
+    local url="$1"
+    local output="$2"
+    if ! curl -fsSLk "${cdn_success_url}${url}" -o "$output"; then
+        _red "Failed to download: ${url}"
+        _red "下载失败：${url}"
+        exit 1
+    fi
+}
+
+ensure_lxc_path() {
+    if ! lxc -h >/dev/null 2>&1; then
+        grep -qxF 'alias lxc="/snap/bin/lxc"' /root/.bashrc 2>/dev/null || echo 'alias lxc="/snap/bin/lxc"' >>/root/.bashrc
+    fi
+    export PATH="$PATH:/snap/bin"
+}
+
 statistics_of_run_times() {
     COUNT=$(curl -4 -ksm1 "https://hits.spiritlhl.net/lxd?action=hit&title=Hits&title_bg=%23555555&count_bg=%2324dde1&edge_flat=false" 2>/dev/null ||
         curl -6 -ksm1 "https://hits.spiritlhl.net/lxd?action=hit&title=Hits&title_bg=%23555555&count_bg=%2324dde1&edge_flat=false" 2>/dev/null)
-    if echo "" | grep -P "test" >/dev/null 2>&1; then
-        TODAY=$(echo "$COUNT" | grep -oP '"daily":\s*[0-9]+' | sed 's/"daily":[[:space:]]*\([0-9]*\)/\1/')
-        TOTAL=$(echo "$COUNT" | grep -oP '"total":\s*[0-9]+' | sed 's/"total":[[:space:]]*\([0-9]*\)/\1/')
-    else
-        TODAY=$(echo "$COUNT" | grep -oE '"daily":[[:space:]]*[0-9]+' | sed 's/"daily":[[:space:]]*\([0-9]*\)/\1/')
-        TOTAL=$(echo "$COUNT" | grep -oE '"total":[[:space:]]*[0-9]+' | sed 's/"total":[[:space:]]*\([0-9]*\)/\1/')
-    fi
+    TODAY=$(echo "$COUNT" | grep -oE '"daily":[[:space:]]*[0-9]+' | sed 's/"daily":[[:space:]]*\([0-9]*\)/\1/')
+    TOTAL=$(echo "$COUNT" | grep -oE '"total":[[:space:]]*[0-9]+' | sed 's/"total":[[:space:]]*\([0-9]*\)/\1/')
 }
 
 rebuild_cloud_init() {
@@ -373,6 +386,7 @@ install_lxd() {
     if [[ "$snap_core" =~ core.* ]] && [[ "$snap_lxd" =~ lxd.* ]]; then
         _green "lxd is installed"
         _green "lxd已安装"
+        ensure_lxc_path
         lxd_lxc_detect=$(lxc list)
         if [[ "$lxd_lxc_detect" =~ "snap-update-ns failed with code1".* ]]; then
             service_manager restart apparmor
@@ -390,9 +404,8 @@ install_lxd() {
             snap install core
             snap install lxd
         fi
-        ! lxc -h >/dev/null 2>&1 && echo 'alias lxc="/snap/bin/lxc"' >>/root/.bashrc && source /root/.bashrc
-        export PATH=$PATH:/snap/bin
-        ! lxc -h >/dev/null 2>&1 && _yellow 'lxc路径有问题，请检查修复' && exit
+        ensure_lxc_path
+        ! lxc -h >/dev/null 2>&1 && _yellow 'lxc路径有问题，请检查修复' && exit 1
         _green "LXD installation complete"
         _green "LXD安装完成"
     fi
@@ -595,7 +608,9 @@ create_storage_pool_with_custom_path() {
             _yellow "检测到旧的循环文件，正在清理..."
             _yellow "Detected old loop file, cleaning up..."
             vgremove -f lxd_vg 2>/dev/null || true
-            losetup -d $(losetup -j "$loop_file" | cut -d: -f1) 2>/dev/null || true
+            while IFS= read -r old_loop_dev; do
+                [ -n "$old_loop_dev" ] && losetup -d "$old_loop_dev" 2>/dev/null || true
+            done < <(losetup -j "$loop_file" | cut -d: -f1)
             rm -f "$loop_file"
         fi
         _green "创建稀疏文件：$loop_file (${disk_nums}GB)..."
@@ -624,7 +639,9 @@ create_storage_pool_with_custom_path() {
         if [ -f "$loop_file" ]; then
             _yellow "检测到旧的循环文件，正在删除..."
             _yellow "Detected old loop file, removing..."
-            losetup -d $(losetup -j "$loop_file" | cut -d: -f1) 2>/dev/null || true
+            while IFS= read -r old_loop_dev; do
+                [ -n "$old_loop_dev" ] && losetup -d "$old_loop_dev" 2>/dev/null || true
+            done < <(losetup -j "$loop_file" | cut -d: -f1)
             rm -f "$loop_file"
         fi
         mkdir -p "$mount_point"
@@ -646,8 +663,8 @@ create_storage_pool_with_custom_path() {
             _red "Mount failed"
             return 1
         fi
-        if ! grep -q "$loop_file" /etc/fstab 2>/dev/null; then
-            echo "$loop_file $mount_point btrfs loop 0 0" >> /etc/fstab
+        if ! grep -Fq "$loop_file" /etc/fstab 2>/dev/null; then
+            echo "$loop_file $mount_point btrfs loop 0 0" >>/etc/fstab
             _green "已添加到 /etc/fstab 实现开机自动挂载"
             _green "Added to /etc/fstab for automatic mounting on boot"
         fi
@@ -703,7 +720,7 @@ execute_storage_init() {
         if /snap/bin/lxc storage list 2>/dev/null | grep -q "^| default"; then
             _yellow "检测到 default 存储池存在，尝试删除..."
             _yellow "Default storage pool exists, trying to delete..."
-            /snap/bin/lxc storage volume list default 2>/dev/null | awk 'NR>3 {print $2}' | while read vol; do
+            /snap/bin/lxc storage volume list default 2>/dev/null | awk 'NR>3 {print $2}' | while read -r vol; do
                 [ -n "$vol" ] && /snap/bin/lxc storage volume delete default "$vol" 2>/dev/null || true
             done
             if /snap/bin/lxc storage delete default 2>/dev/null; then
@@ -881,12 +898,13 @@ setup_storage() {
 }
 
 configure_lxd_network() {
-    ! lxc -h >/dev/null 2>&1 && echo 'alias lxc="/snap/bin/lxc"' >>/root/.bashrc && source /root/.bashrc
-    export PATH=$PATH:/snap/bin
+    ensure_lxc_path
     ! lxc -h >/dev/null 2>&1 && _yellow '使用 lxc -h 检测到路径有问题，请手动查看LXD是否安装成功' && exit 1
     lxc config unset images.auto_update_interval
     lxc config set images.auto_update_interval 0
-    lxc remote add opsmaru https://images.opsmaru.dev/spaces/9bfad87bd318b8f06012059a --public --protocol simplestreams
+    if ! lxc remote list 2>/dev/null | grep -q '^| opsmaru[[:space:]]*|'; then
+        lxc remote add opsmaru https://images.opsmaru.dev/spaces/9bfad87bd318b8f06012059a --public --protocol simplestreams
+    fi
     lxc network set lxdbr0 ipv6.address auto
 }
 
@@ -899,8 +917,8 @@ download_preset_files() {
     )
     for file in "${files[@]}"; do
         filename=$(basename "$file")
-        rm -rf "$filename"
-        curl -sLk "${cdn_success_url}${file}" -o "$filename"
+        rm -f -- "$filename"
+        download_file "$file" "$filename"
         chmod 777 "$filename"
         dos2unix "$filename"
     done
@@ -941,10 +959,10 @@ configure_system() {
 
 remove_system_limits() {
     if [ -f "/etc/security/limits.conf" ]; then
-        if ! grep -q "*          hard    nproc       unlimited" /etc/security/limits.conf; then
+        if ! grep -Fq "*          hard    nproc       unlimited" /etc/security/limits.conf; then
             echo '*          hard    nproc       unlimited' | sudo tee -a /etc/security/limits.conf
         fi
-        if ! grep -q "*          soft    nproc       unlimited" /etc/security/limits.conf; then
+        if ! grep -Fq "*          soft    nproc       unlimited" /etc/security/limits.conf; then
             echo '*          soft    nproc       unlimited' | sudo tee -a /etc/security/limits.conf
         fi
     fi
@@ -958,13 +976,13 @@ remove_system_limits() {
 
 install_dns_check() {
     if [ ! -f /usr/local/bin/check-dns.sh ]; then
-        wget ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/check-dns.sh -O /usr/local/bin/check-dns.sh
+        download_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/check-dns.sh" /usr/local/bin/check-dns.sh
         chmod +x /usr/local/bin/check-dns.sh
     else
         echo "Script already exists. Skipping installation."
     fi
     if [ ! -f /etc/systemd/system/check-dns.service ]; then
-        wget ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/check-dns.service -O /etc/systemd/system/check-dns.service
+        download_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/check-dns.service" /etc/systemd/system/check-dns.service
         chmod +x /etc/systemd/system/check-dns.service
         service_manager daemon-reload
         service_manager enable check-dns.service
@@ -1020,7 +1038,7 @@ setup_network_preferences() {
                 install_package iptables-services 2>/dev/null || true
             fi
         fi
-        iptables -t nat -A POSTROUTING -j MASQUERADE
+        iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -j MASQUERADE
         mkdir -p /etc/iptables
         iptables-save > /etc/iptables/rules.v4 2>/dev/null
         if command -v netfilter-persistent >/dev/null 2>&1; then

@@ -3,10 +3,10 @@
 # 2023.06.29
 # 预检测本机是否符合开设LXC容器的要求
 
-_red() { echo -e "\033[31m\033[01m$@\033[0m"; }
-_green() { echo -e "\033[32m\033[01m$@\033[0m"; }
-_yellow() { echo -e "\033[33m\033[01m$@\033[0m"; }
-_blue() { echo -e "\033[36m\033[01m$@\033[0m"; }
+_red() { printf '\033[31m\033[01m%s\033[0m\n' "$*"; }
+_green() { printf '\033[32m\033[01m%s\033[0m\n' "$*"; }
+_yellow() { printf '\033[33m\033[01m%s\033[0m\n' "$*"; }
+_blue() { printf '\033[36m\033[01m%s\033[0m\n' "$*"; }
 utf8_locale=$(locale -a 2>/dev/null | grep -i -m 1 -E "utf8|UTF-8")
 if [[ -z "$utf8_locale" ]]; then
     _yellow "No UTF-8 locale found"
@@ -32,7 +32,7 @@ else
 fi
 
 # 必须是全虚拟化的架构
-virtcheck=$(systemd-detect-virt)
+virtcheck=$(systemd-detect-virt 2>/dev/null || true)
 case "$virtcheck" in
 kvm) VIRT='kvm' ;;
 openvz) VIRT='openvz' ;;
@@ -51,10 +51,8 @@ fi
 # 检查系统版本是否符合要求
 if [ -n "$(command -v lsb_release)" ]; then
     distro=$(lsb_release -is)
-    codename=$(lsb_release -cs)
 else
     distro=$(cat /etc/*release | grep -E '^ID=' | awk -F= '{ print $2 }' | tr -d \")
-    codename=$(cat /etc/*release | grep -E '^VERSION_CODENAME=' | awk -F= '{ print $2 }' | tr -d \")
 fi
 
 if [[ "$distro" != "Ubuntu" && "$distro" != "ubuntu" && "$distro" != "Debian" && "$distro" != "debian" ]]; then
@@ -88,7 +86,7 @@ fi
 
 # 检查内存大小是否符合要求
 mem=$(awk '/MemTotal/{print $2}' /proc/meminfo)
-if [ $mem -lt 524288 ]; then
+if [ "$mem" -lt 524288 ]; then
     _yellow "memory size does not meet the requirements, need at least 512MB. (The actual smaller is fine, self-judgment, subsequent installation of open virtual memory SWAP can make up for the lack of this piece)"
     _yellow "内存大小不符合要求，需要至少512MB。(实际小点也行，自行判断，后续安装开虚拟内存SWAP可弥补这块的不足)"
     exit 1
@@ -99,7 +97,7 @@ fi
 
 # 检查磁盘空间是否符合要求
 disk=$(df / | awk '/\//{print $4}')
-if [ $disk -lt 9485760 ]; then
+if [ "$disk" -lt 9485760 ]; then
     _yellow "The local hard disk space does not meet the requirements, need at least 10G.(Actually smaller is fine, the installation needs about 500M~2G hard disk space, varies from system to system, the hard disk occupation on Ubuntu is the smallest)"
     _yellow "本机硬盘空间不符合要求，需要至少10G。(实际小点也行，安装大概需要500M~2G硬盘空间，因系统而异，在Ubuntu上的硬盘占用是最小的)"
     exit 1

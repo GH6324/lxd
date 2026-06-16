@@ -37,7 +37,7 @@ add_swap() {
         swapsize="${SWAP_SIZE:-${swapsize:-}}"
     else
         echo -e "${Green}请输入需要添加的swap，建议为内存的2倍！${Font}"
-        read -p "请输入swap数值:" swapsize
+        read -rp "请输入swap数值:" swapsize
     fi
     if ! validate_swap_size "$swapsize"; then
         echo -e "${Red}SWAP_SIZE must be a positive integer in MB!${Font}"
@@ -107,7 +107,7 @@ main() {
     echo -e "${Green}1、添加swap${Font}"
     echo -e "${Green}2、删除swap${Font}"
     echo -e "———————————————————————————————————————"
-    read -p "请输入数字 [1-2]:" num
+    read -rp "请输入数字 [1-2]:" num
     case "$num" in
     1)
         add_swap

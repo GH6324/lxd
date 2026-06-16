@@ -2,6 +2,10 @@
 
 [![Hits](https://hits.spiritlhl.net/lxd.svg?action=hit&title=Hits&title_bg=%23555555&count_bg=%230eecf8&edge_flat=false)](https://hits.spiritlhl.net)
 
+## 维护状态
+
+本项目已进入有限维护模式，仅继续修复安装、卸载、IPv6、端口映射和无交互参数等核心问题。Ubuntu 宿主机仍可按现有脚本使用；非 Ubuntu 宿主机、需要 Incus 新特性或长期维护能力的环境，建议迁移到 [oneclickvirt/incus](https://github.com/oneclickvirt/incus)。
+
 ## 前言
 
 缘由: https://t.me/spiritlhl/176
@@ -15,6 +19,8 @@
 2026.06.02
 
 - 统一无交互入口为 `export noninteractive=true`，并补齐批量新增、卸载、swap 等脚本的无交互参数校验
+- 修复 Alpine/OpenWrt SSH 初始化、IPv6 nftables 恢复和代理端口重复配置边界
+- 优化包屏蔽、监控和 Docker 临时脚本的可重入与非交互行为
 
 ## 无交互用法
 

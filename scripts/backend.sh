@@ -2,6 +2,8 @@
 # by https://github.com/oneclickvirt/lxd
 # 2023.09.05
 
+export DEBIAN_FRONTEND=noninteractive
+
 # 服务管理兼容性函数
 service_manager() {
     local action=$1
@@ -94,12 +96,21 @@ elif command -v yum >/dev/null 2>&1; then
 elif command -v dnf >/dev/null 2>&1; then
     dnf install -y make gcc glibc-devel sqlite-devel gd-devel
 fi
-cd /usr/src
-wget https://humdi.net/vnstat/vnstat-2.11.tar.gz
+cd /usr/src || exit 1
+if ! wget https://humdi.net/vnstat/vnstat-2.11.tar.gz; then
+    echo "Failed to download vnstat source."
+    exit 1
+fi
 chmod 777 vnstat-2.11.tar.gz
-tar zxvf vnstat-2.11.tar.gz
-cd vnstat-2.11
-./configure --prefix=/usr --sysconfdir=/etc && make && make install
+if ! tar zxvf vnstat-2.11.tar.gz; then
+    echo "Failed to extract vnstat source."
+    exit 1
+fi
+cd vnstat-2.11 || exit 1
+if ! ./configure --prefix=/usr --sysconfdir=/etc || ! make || ! make install; then
+    echo "Failed to build vnstat."
+    exit 1
+fi
 cp -v examples/systemd/vnstat.service /etc/systemd/system/
 service_manager enable vnstat
 service_manager start vnstat
@@ -107,4 +118,3 @@ pgrep -c vnstatd
 vnstat -v
 vnstatd -v
 vnstati -v
-

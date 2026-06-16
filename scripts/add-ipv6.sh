@@ -10,9 +10,21 @@ get_interface() {
         iface=$(lshw -C network 2>/dev/null | awk '/logical name:/{print $3}' | head -1)
     fi
     if [ -z "$iface" ]; then
-        iface=$(ls /sys/class/net/ | grep -v "$(ls /sys/devices/virtual/net/)" | head -1)
+        local iface_path
+        for iface_path in /sys/class/net/*; do
+            [ -e "$iface_path" ] || continue
+            local candidate
+            candidate=$(basename "$iface_path")
+            [ -e "/sys/devices/virtual/net/$candidate" ] && continue
+            iface="$candidate"
+            break
+        done
     fi
     echo "$iface"
+}
+
+extract_nft_daddr() {
+    sed -nE 's/.*ip6[[:space:]]+daddr[[:space:]]+([0-9A-Fa-f:]+).*/\1/p' /etc/nftables.conf | sort -u
 }
 
 # 恢复iptables规则（原始方式，优先）
@@ -91,7 +103,7 @@ restore_nft() {
     local addrs=()
     while IFS= read -r addr; do
         [ -n "$addr" ] && addrs+=("$addr")
-    done < <(grep -oP 'ip6 daddr \K[0-9a-f:]+' /etc/nftables.conf | sort -u)
+    done < <(extract_nft_daddr)
     if [ ${#addrs[@]} -gt 0 ]; then
         # 读取存储的前缀长度，回退到64
         local prefix_len=64

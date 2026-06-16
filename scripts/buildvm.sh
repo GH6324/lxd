@@ -12,7 +12,8 @@ check_vm_support() {
         echo "错误：LXD未安装或不在PATH中"
         exit 1
     fi
-    local drivers=$(lxc info | grep -i "driver:")
+    local drivers
+    drivers=$(lxc info | grep -i "driver:")
     echo "Available drivers: $drivers"
     echo "可用驱动: $drivers"
     if ! echo "$drivers" | grep -qi "qemu"; then
@@ -23,10 +24,8 @@ check_vm_support() {
         exit 1
     fi
     # Detect KVM hardware acceleration vs QEMU TCG software emulation
-    VM_ACCEL="tcg"
     if [ -e /dev/kvm ]; then
         if [ -w /dev/kvm ]; then
-            VM_ACCEL="kvm"
             echo "KVM hardware acceleration available - VMs will use KVM nested virtualization"
             echo "KVM硬件加速可用 - 虚拟机将使用KVM嵌套虚拟化"
         else
@@ -39,8 +38,10 @@ check_vm_support() {
     fi
 }
 
+# shellcheck disable=SC2034
 detect_os() {
     if [ -f /etc/os-release ]; then
+        # shellcheck disable=SC1091
         . /etc/os-release
         case "$ID" in
         ubuntu | pop | neon | zorin)
@@ -140,7 +141,7 @@ detect_os() {
 }
 
 install_dependencies() {
-    cd /root >/dev/null 2>&1
+    cd /root >/dev/null 2>&1 || exit 1
     if ! command -v jq >/dev/null 2>&1; then
         $PACKAGETYPE_INSTALL jq
     fi
@@ -158,7 +159,8 @@ check_china() {
 
 check_cdn() {
     local o_url=$1
-    local shuffled_cdn_urls=($(shuf -e "${cdn_urls[@]}"))
+    local shuffled_cdn_urls=()
+    mapfile -t shuffled_cdn_urls < <(printf '%s\n' "${cdn_urls[@]}" | shuf)
     for cdn_url in "${shuffled_cdn_urls[@]}"; do
         if curl -4 -sL -k "$cdn_url$o_url" --max-time 6 | grep -q "success" >/dev/null 2>&1; then
             export cdn_success_url="$cdn_url"
@@ -217,15 +219,32 @@ retry_wget() {
 }
 
 detect_arch() {
+    sys_bit=""
+    sys_bit_alt=""
     sysarch="$(uname -m)"
     case "${sysarch}" in
-    "x86_64" | "x86" | "amd64" | "x64") sys_bit="amd64" ;;
-    "i386" | "i686") sys_bit="i686" ;;
-    "aarch64" | "armv8" | "armv8l") sys_bit="arm64" ;;
-    "armv7l") sys_bit="armv7l" ;;
+    "x86_64" | "x86" | "amd64" | "x64")
+        sys_bit="amd64"
+        sys_bit_alt="x86_64"
+        ;;
+    "i386" | "i686")
+        sys_bit="i686"
+        sys_bit_alt="i386"
+        ;;
+    "aarch64" | "armv8" | "armv8l")
+        sys_bit="arm64"
+        sys_bit_alt="aarch64"
+        ;;
+    "armv7l")
+        sys_bit="armv7l"
+        sys_bit_alt="armhf"
+        ;;
     "s390x") sys_bit="s390x" ;;
     "ppc64le") sys_bit="ppc64le" ;;
-    *) sys_bit="amd64" ;;
+    *)
+        sys_bit="amd64"
+        sys_bit_alt="x86_64"
+        ;;
     esac
 }
 
@@ -249,7 +268,16 @@ validate_positive_port() {
     validate_positive_int "$1" && [ "$1" -le 65535 ]
 }
 
+validate_instance_name() {
+    [ -n "$1" ] && [ "$1" != "." ] && [ "$1" != ".." ] && [[ "$1" != -* ]] && [[ "$1" != */* ]]
+}
+
 validate_inputs() {
+    if ! validate_instance_name "$name"; then
+        echo "Error: VM name must not be empty, start with '-', or contain '/'."
+        echo "错误：虚拟机名称不能为空，不能以 '-' 开头，也不能包含 '/'。"
+        exit 1
+    fi
     if ! validate_positive_int "$cpu" || ! validate_positive_int "$memory" || ! validate_positive_int "$in" || ! validate_positive_int "$out"; then
         echo "Error: CPU, memory and speed values must be positive integers."
         echo "错误：CPU、内存和网速参数必须是正整数。"
@@ -277,6 +305,111 @@ validate_inputs() {
     fi
 }
 
+replace_proxy_device() {
+    local device_name="$1"
+    shift
+    lxc config device remove "$name" "$device_name" 2>/dev/null || true
+    lxc config device add "$name" "$device_name" proxy "$@"
+}
+
+remove_device_if_exists() {
+    local device_name="$1"
+    lxc config device remove "$name" "$device_name" 2>/dev/null || true
+}
+
+ensure_container_ipv6_cron() {
+    # shellcheck disable=SC2016
+    lxc exec "$name" -- sh -c 'cron_line="*/1 * * * * curl -m 6 -s ipv6.ip.sb && curl -m 6 -s ipv6.ip.sb"; if ! crontab -l 2>/dev/null | grep -Fqx "$cron_line"; then (crontab -l 2>/dev/null; printf "%s\n" "$cron_line") | crontab -; fi'
+}
+
+download_host_file() {
+    local url="$1"
+    local output="$2"
+    if ! curl -fsSLk "${cdn_success_url}${url}" -o "$output"; then
+        echo "Failed to download: $url"
+        echo "下载失败：$url"
+        exit 1
+    fi
+}
+
+strip_image_separators() {
+    local value="$1"
+    while [[ "$value" == [/:_.-]* ]]; do
+        value="${value#?}"
+    done
+    while [[ "$value" == *[/:_.-] ]]; do
+        value="${value%?}"
+    done
+    printf '%s\n' "$value"
+}
+
+canonical_image_family() {
+    local family="$1"
+    case "$family" in
+    alma) family="almalinux" ;;
+    rocky) family="rockylinux" ;;
+    oraclelinux | oracle-linux | oracle_linux) family="oracle" ;;
+    arch) family="archlinux" ;;
+    esac
+    printf '%s\n' "$family"
+}
+
+normalize_image_system() {
+    local raw="${1:-}"
+    local input prefix
+    input="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    input="${input#images:}"
+    input="${input#opsmaru:}"
+    input="$(strip_image_separators "$input")"
+    if [ -z "$input" ]; then
+        return 1
+    fi
+    if [[ "$input" == */* ]]; then
+        a="${input%%/*}"
+        b="${input#*/}"
+        b="${b%%/*}"
+    else
+        prefix="${input%%[0-9]*}"
+        if [ "$prefix" != "$input" ]; then
+            a="$prefix"
+            b="${input#"$prefix"}"
+        else
+            a="$input"
+            b=""
+        fi
+    fi
+    a="$(strip_image_separators "$a")"
+    b="$(strip_image_separators "$b")"
+    a="$(canonical_image_family "$a")"
+    normalized_system="${a}${b}"
+    [ -n "$a" ]
+}
+
+remote_image_query() {
+    if [ -n "${b:-}" ]; then
+        printf '%s/%s\n' "$a" "$b"
+    else
+        printf '%s\n' "$a"
+    fi
+}
+
+find_remote_image_alias() {
+    local remote="$1"
+    local image_type="$2"
+    local query
+    command -v lxc >/dev/null 2>&1 || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    query="$(remote_image_query)"
+    lxc image list "${remote}:${query}" --format=json 2>/dev/null | jq -r --arg ARCHITECTURE "${sys_bit:-}" --arg ARCHITECTURE_ALT "${sys_bit_alt:-}" --arg IMAGE_TYPE "$image_type" '
+        .[]?
+        | select((.type // "") == $IMAGE_TYPE)
+        | select($ARCHITECTURE == "" or (.architecture // "") == $ARCHITECTURE or ($ARCHITECTURE_ALT != "" and (.architecture // "") == $ARCHITECTURE_ALT))
+        | .aliases[]?
+        | .name // empty
+        | select(length > 0)
+    ' | head -n 1
+}
+
 format_disk_size() {
     if [[ $disk == *.* ]]; then
         disk_mb=$(awk -v disk="$disk" 'BEGIN { mb = int(disk * 1024); if (mb < 1) mb = 1; printf "%d", mb }')
@@ -293,7 +426,8 @@ get_kvm_images() {
         "https://githubapi.spiritlhl.workers.dev"
     )
     for api_url in "${api_urls[@]}"; do
-        local response=$(curl -4 -s -m 6 "${api_url}/repos/oneclickvirt/lxd_images/releases/tags/kvm_images")
+        local response
+        response=$(curl -4 -s -m 6 "${api_url}/repos/oneclickvirt/lxd_images/releases/tags/kvm_images")
         if [ $? -eq 0 ] && echo "$response" | jq -e '.assets' >/dev/null 2>&1; then
             echo "$response" | jq -r '.assets[].name'
             return 0
@@ -307,7 +441,8 @@ handle_image() {
     image_download_url=""
     fixed_system=false
     if [[ "$sys_bit" == "amd64" || "$sys_bit" == "arm64" ]]; then
-        local kvm_images=($(get_kvm_images))
+        local kvm_images=()
+        mapfile -t kvm_images < <(get_kvm_images)
         if [ ${#kvm_images[@]} -eq 0 ]; then
             echo "Failed to get KVM images list"
             echo "获取KVM镜像列表失败"
@@ -367,35 +502,45 @@ import_image() {
         system="$short_alias"
         return 0
     fi
-    retry_wget "${cdn_success_url}${image_url}" "$image_name"
+    if ! retry_wget "${cdn_success_url}${image_url}" "$image_name"; then
+        echo "Failed to download image: $image_url"
+        echo "镜像下载失败：$image_url"
+        exit 1
+    fi
     chmod 777 "$image_name"
-    unzip "$image_name"
-    rm -rf "$image_name"
-    lxc image import lxd.tar.xz disk.qcow2 --alias "$short_alias"
-    rm -rf lxd.tar.xz disk.qcow2
+    if ! unzip "$image_name"; then
+        rm -f -- "$image_name"
+        echo "Failed to unzip image: $image_name"
+        echo "镜像解压失败：$image_name"
+        exit 1
+    fi
+    rm -f -- "$image_name"
+    if ! lxc image import lxd.tar.xz disk.qcow2 --alias "$short_alias"; then
+        rm -f -- lxd.tar.xz disk.qcow2
+        echo "Failed to import image: $short_alias"
+        echo "镜像导入失败：$short_alias"
+        exit 1
+    fi
+    rm -f -- lxd.tar.xz disk.qcow2
     system="$short_alias"
 }
 
 check_standard_images() {
-    system=$(lxc image list images:${a}/${b} --format=json | jq -r --arg ARCHITECTURE "$sys_bit" '.[] | select(.type == "virtual-machine" and .architecture == $ARCHITECTURE) | .aliases[0].name' | head -n 1)
+    system="$(find_remote_image_alias images virtual-machine)"
     if [ -n "$system" ]; then
         echo "A matching image exists and will be created using images:${system}"
         echo "匹配的镜像存在，将使用 images:${system} 进行创建"
         fixed_system=false
         return
     fi
-    system=$(lxc image list opsmaru:${a}/${b} --format=json | jq -r --arg ARCHITECTURE "$sys_bit" '.[] | select(.type == "virtual-machine" and .architecture == $ARCHITECTURE) | .aliases[0].name' | head -n 1)
-    if [ $? -ne 0 ]; then
-        status_tuna=false
+    system="$(find_remote_image_alias opsmaru virtual-machine)"
+    if [ -n "$system" ]; then
+        echo "A matching image exists and will be created using opsmaru:${system}"
+        echo "匹配的镜像存在，将使用 opsmaru:${system} 进行创建"
+        status_tuna=true
+        fixed_system=false
     else
-        if echo "$system" | grep -q "${a}"; then
-            echo "A matching image exists and will be created using opsmaru:${system}"
-            echo "匹配的镜像存在，将使用 opsmaru:${system} 进行创建"
-            status_tuna=true
-            fixed_system=false
-        else
-            status_tuna=false
-        fi
+        status_tuna=false
     fi
     if [ -z "$image_download_url" ] && [ "$status_tuna" = false ]; then
         echo "No matching image found, please execute"
@@ -409,12 +554,12 @@ check_standard_images() {
 }
 
 create_vm() {
-    rm -rf "$name"
+    rm -f -- "$name"
     disk_size=$(format_disk_size)
     if [ -z "$image_download_url" ] && [ "$status_tuna" = true ]; then
-        lxc init opsmaru:${system} "$name" --vm -c limits.cpu="$cpu" -c limits.memory="$memory"MiB -d root,size="$disk_size" -s default
+        lxc init "opsmaru:${system}" "$name" --vm -c limits.cpu="$cpu" -c limits.memory="$memory"MiB -d root,size="$disk_size" -s default
     elif [ -z "$image_download_url" ]; then
-        lxc init images:${system} "$name" --vm -c limits.cpu="$cpu" -c limits.memory="$memory"MiB -d root,size="$disk_size" -s default
+        lxc init "images:${system}" "$name" --vm -c limits.cpu="$cpu" -c limits.memory="$memory"MiB -d root,size="$disk_size" -s default
     else
         lxc init "$system" "$name" --vm -c limits.cpu="$cpu" -c limits.memory="$memory"MiB -d root,size="$disk_size" -s default
     fi
@@ -458,8 +603,8 @@ setup_mirror_and_packages() {
         lxc exec "$name" -- apt-get install curl -y --fix-missing
         lxc exec "$name" -- curl -lk https://gitee.com/SuperManito/LinuxMirrors/raw/main/ChangeMirrors.sh -o ChangeMirrors.sh
         lxc exec "$name" -- chmod 777 ChangeMirrors.sh
-        lxc exec "$name" -- ./ChangeMirrors.sh --source mirrors.tuna.tsinghua.edu.cn --web-protocol http --intranet false --backup true --updata-software false --clean-cache false --ignore-backup-tips > /dev/null > /dev/null
-        lxc exec "$name" -- rm -rf ChangeMirrors.sh
+        lxc exec "$name" -- ./ChangeMirrors.sh --source mirrors.tuna.tsinghua.edu.cn --web-protocol http --intranet false --backup true --updata-software false --clean-cache false --ignore-backup-tips >/dev/null
+        lxc exec "$name" -- rm -f -- ChangeMirrors.sh
     fi
     if echo "$system" | grep -qiE "centos|almalinux|fedora|rocky|oracle"; then
         lxc exec "$name" -- sudo yum update -y
@@ -486,7 +631,7 @@ setup_ssh() {
 
 setup_ssh_bash() {
     if [ ! -f /usr/local/bin/ssh_bash.sh ]; then
-        curl -L ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_bash.sh -o /usr/local/bin/ssh_bash.sh
+        download_host_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_bash.sh" /usr/local/bin/ssh_bash.sh
         chmod 777 /usr/local/bin/ssh_bash.sh
         dos2unix /usr/local/bin/ssh_bash.sh
     fi
@@ -494,9 +639,9 @@ setup_ssh_bash() {
     lxc file push /root/ssh_bash.sh "$name"/root/
     lxc exec "$name" -- chmod 777 ssh_bash.sh
     lxc exec "$name" -- dos2unix ssh_bash.sh
-    lxc exec "$name" -- sudo ./ssh_bash.sh $passwd
+    lxc exec "$name" -- sudo ./ssh_bash.sh "$passwd"
     if [ ! -f /usr/local/bin/config.sh ]; then
-        curl -L ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/config.sh -o /usr/local/bin/config.sh
+        download_host_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/config.sh" /usr/local/bin/config.sh
         chmod 777 /usr/local/bin/config.sh
         dos2unix /usr/local/bin/config.sh
     fi
@@ -514,7 +659,7 @@ wait_for_vm_ready_to_shutdown() {
     local max_wait=18
     local check_interval=6
     local waited=0
-    while [ $waited -lt $max_wait ]; do
+    while [ "$waited" -lt "$max_wait" ]; do
         if lxc exec "$name" -- pgrep -f "apt|yum|pacman|apk" > /dev/null 2>&1; then
             echo "VM is executing package management operations, continue waiting..."
             echo "虚拟机正在执行包管理操作，继续等待..."
@@ -522,12 +667,12 @@ wait_for_vm_ready_to_shutdown() {
             echo "VM is executing SSH configuration, continue waiting..."
             echo "虚拟机正在执行SSH配置，继续等待..."
         fi
-        sleep $check_interval
+        sleep "$check_interval"
         waited=$((waited + check_interval))
         echo "Waited ${waited} seconds..."
         echo "已等待 ${waited} 秒..."
     done
-    if [ $waited -ge $max_wait ]; then
+    if [ "$waited" -ge "$max_wait" ]; then
         echo "Wait timeout, forcing shutdown process..."
         echo "等待超时，强制继续关机流程..."
     fi
@@ -539,8 +684,9 @@ safe_shutdown_vm() {
     lxc stop "$name" --timeout=30
     local max_shutdown_wait=30
     local waited=0
-    while [ $waited -lt $max_shutdown_wait ]; do
-        local vm_status=$(lxc info "$name" | grep "Status:" | awk '{print $2}')
+    while [ "$waited" -lt "$max_shutdown_wait" ]; do
+        local vm_status
+        vm_status=$(lxc info "$name" | grep "Status:" | awk '{print $2}')
         if [ "$vm_status" = "STOPPED" ]; then
             echo "VM has been safely stopped"
             echo "虚拟机已安全停止"
@@ -592,10 +738,10 @@ configure_network() {
         if [ "$enable_ipv6" == "y" ]; then
             echo "Configuring IPv6..."
             echo "配置IPv6..."
-            lxc exec "$name" -- sh -c 'echo "*/1 * * * * curl -m 6 -s ipv6.ip.sb && curl -m 6 -s ipv6.ip.sb" | crontab -'
+            ensure_container_ipv6_cron
             sleep 1
             if [ ! -f "./build_ipv6_network.sh" ]; then
-                curl -L ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/build_ipv6_network.sh -o build_ipv6_network.sh
+                download_host_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/build_ipv6_network.sh" build_ipv6_network.sh
                 chmod +x build_ipv6_network.sh
             fi
             ./build_ipv6_network.sh "$name"
@@ -615,18 +761,18 @@ configure_network() {
 configure_firewall_ports() {
     if command -v firewall-cmd >/dev/null 2>&1; then
         echo "Configuring firewall-cmd ports..."
-        firewall-cmd --permanent --add-port=${sshn}/tcp
+        firewall-cmd --permanent "--add-port=${sshn}/tcp"
         if [ "$nat1" != "0" ] && [ "$nat2" != "0" ]; then
-            firewall-cmd --permanent --add-port=${nat1}-${nat2}/tcp
-            firewall-cmd --permanent --add-port=${nat1}-${nat2}/udp
+            firewall-cmd --permanent "--add-port=${nat1}-${nat2}/tcp"
+            firewall-cmd --permanent "--add-port=${nat1}-${nat2}/udp"
         fi
         firewall-cmd --reload
     elif command -v ufw >/dev/null 2>&1; then
         echo "Configuring ufw ports..."
-        ufw allow ${sshn}/tcp
+        ufw allow "${sshn}/tcp"
         if [ "$nat1" != "0" ] && [ "$nat2" != "0" ]; then
-            ufw allow ${nat1}:${nat2}/tcp
-            ufw allow ${nat1}:${nat2}/udp
+            ufw allow "${nat1}:${nat2}/tcp"
+            ufw allow "${nat1}:${nat2}/udp"
         fi
         ufw reload
     fi
@@ -642,7 +788,11 @@ configure_network_limits() {
     fi
     if ! lxc config device override "$name" enp5s0 limits.egress="$out"Mbit limits.ingress="$in"Mbit limits.max="$speed_limit"Mbit 2>/dev/null; then
         echo "Failed to configure enp5s0, trying eth0..."
-        lxc config device override "$name" eth0 limits.egress="$out"Mbit limits.ingress="$in"Mbit limits.max="$speed_limit"Mbit
+        if ! lxc config device override "$name" eth0 limits.egress="$out"Mbit limits.ingress="$in"Mbit limits.max="$speed_limit"Mbit 2>/dev/null; then
+            lxc config device set "$name" eth0 limits.egress "$out"Mbit
+            lxc config device set "$name" eth0 limits.ingress "$in"Mbit
+            lxc config device set "$name" eth0 limits.max "$speed_limit"Mbit
+        fi
     fi
 }
 
@@ -668,17 +818,20 @@ configure_port_mapping() {
     echo "Configuring port mapping..."
     echo "配置端口映射..."
     echo "Adding SSH port mapping: $host_ip:$sshn -> $vm_ip:22"
-    lxc config device add "$name" ssh-port proxy listen=tcp:$host_ip:$sshn connect=tcp:$vm_ip:22 nat=true
+    replace_proxy_device ssh-port "listen=tcp:$host_ip:$sshn" "connect=tcp:$vm_ip:22" nat=true
     if [ "$nat1" != "0" ] && [ "$nat2" != "0" ]; then
         echo "Adding NAT TCP port mapping: $host_ip:$nat1-$nat2 -> $vm_ip:$nat1-$nat2"
-        lxc config device add "$name" nattcp-ports proxy listen=tcp:$host_ip:$nat1-$nat2 connect=tcp:$vm_ip:$nat1-$nat2 nat=true
+        replace_proxy_device nattcp-ports "listen=tcp:$host_ip:$nat1-$nat2" "connect=tcp:$vm_ip:$nat1-$nat2" nat=true
         echo "Adding NAT UDP port mapping: $host_ip:$nat1-$nat2 -> $vm_ip:$nat1-$nat2"
-        lxc config device add "$name" natudp-ports proxy listen=udp:$host_ip:$nat1-$nat2 connect=udp:$vm_ip:$nat1-$nat2 nat=true
+        replace_proxy_device natudp-ports "listen=udp:$host_ip:$nat1-$nat2" "connect=udp:$vm_ip:$nat1-$nat2" nat=true
+    else
+        remove_device_if_exists nattcp-ports
+        remove_device_if_exists natudp-ports
     fi
 }
 
 cleanup_and_finish() {
-    rm -rf ssh_bash.sh config.sh ssh_sh.sh
+    rm -f -- ssh_bash.sh config.sh ssh_sh.sh
     if [ "$nat1" != "0" ] && [ "$nat2" != "0" ]; then
         echo "$name $sshn $passwd $nat1 $nat2" >>"$name"
         echo "$name $sshn $passwd $nat1 $nat2"
@@ -704,8 +857,12 @@ main() {
     enable_ipv6="${10:-N}"
     enable_ipv6=$(echo "$enable_ipv6" | tr '[:upper:]' '[:lower:]')
     system="${11:-debian11}"
-    a="${system%%[0-9]*}"
-    b="${system##*[!0-9.]}"
+    if ! normalize_image_system "$system"; then
+        echo "Error: system must be a valid image name, such as debian11 or debian/11."
+        echo "错误：系统名称必须有效，例如 debian11 或 debian/11。"
+        exit 1
+    fi
+    system="$normalized_system"
     detect_os
     validate_inputs
     install_dependencies

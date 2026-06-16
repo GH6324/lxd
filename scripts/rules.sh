@@ -47,10 +47,22 @@ save_firewall_rules() {
     fi
 }
 
+write_apt_pin() {
+    local prefs_file="/etc/apt/preferences"
+    local pin_header="Package: zmap nmap masscan medusa apache2-utils hping3"
+    if ! grep -Fq "$pin_header" "$prefs_file" 2>/dev/null; then
+        cat >>"$prefs_file" <<'EOF'
+Package: zmap nmap masscan medusa apache2-utils hping3
+Pin: release *
+Pin-Priority: -1
+EOF
+    fi
+}
+
 # 容器内屏蔽安装包
 if command -v apt-get >/dev/null 2>&1; then
     if ! dpkg -s apparmor &>/dev/null; then
-        apt-get install -y apparmor 2>/dev/null
+        DEBIAN_FRONTEND=noninteractive apt-get install -y apparmor 2>/dev/null
     fi
 fi
 
@@ -59,16 +71,16 @@ divert_install_script() {
     local package_name=$1
     local divert_script="/usr/local/sbin/${package_name}-install"
     local install_script="/var/lib/dpkg/info/${package_name}.postinst"
+    mkdir -p "$(dirname "$divert_script")" "$(dirname "$install_script")"
     ln -sf "${divert_script}" "${install_script}"
-    sh -c "echo '#!/bin/bash' > ${divert_script}"
-    sh -c "echo 'exit 1' >> ${divert_script}"
+    printf '#!/bin/bash\n' >"${divert_script}"
+    printf 'exit 1\n' >>"${divert_script}"
     chmod +x "${divert_script}"
 }
 
 if command -v apt-get >/dev/null 2>&1; then
-    echo "Package: zmap nmap masscan medusa apache2-utils hping3
-Pin: release *
-Pin-Priority: -1" | sudo tee -a /etc/apt/preferences
+    export DEBIAN_FRONTEND=noninteractive
+    write_apt_pin
     apt-get update
 fi
 divert_install_script "zmap"

@@ -57,10 +57,15 @@ service_manager() {
     $success && return 0 || return 1
 }
 
+append_nameserver_once() {
+    local server="$1"
+    grep -qxF "nameserver $server" /etc/resolv.conf 2>/dev/null || echo "nameserver $server" >>/etc/resolv.conf
+}
+
 if [ -f "/etc/resolv.conf" ]; then
     cp /etc/resolv.conf /etc/resolv.conf.bak
-    echo "nameserver 8.8.8.8" | tee -a /etc/resolv.conf >/dev/null
-    echo "nameserver 8.8.4.4" | tee -a /etc/resolv.conf >/dev/null
+    append_nameserver_once "8.8.8.8"
+    append_nameserver_once "8.8.4.4"
 fi
 
 temp_file_apt_fix="/tmp/apt_fix.txt"
@@ -68,7 +73,9 @@ REGEX=("debian|astra|kali" "ubuntu" "centos|red hat|kernel|oracle linux|alma|roc
 RELEASE=("Debian" "Ubuntu" "CentOS" "CentOS" "Fedora" "Arch" "Alpine" "FreeBSD")
 PACKAGE_UPDATE=("! apt-get update && apt-get --fix-broken install -y && apt-get update" "apt-get update" "yum -y update" "yum -y update" "yum -y update" "pacman -Sy" "apk update" "pkg update")
 PACKAGE_INSTALL=("apt-get -y install" "apt-get -y install" "yum -y install" "yum -y install" "yum -y install" "pacman -Sy --noconfirm --needed" "apk add --no-cache" "pkg install -y")
+# shellcheck disable=SC2034
 PACKAGE_REMOVE=("apt-get -y remove" "apt-get -y remove" "yum -y remove" "yum -y remove" "yum -y remove" "pacman -Rsc --noconfirm" "apk del" "pkg delete")
+# shellcheck disable=SC2034
 PACKAGE_UNINSTALL=("apt-get -y autoremove" "apt-get -y autoremove" "yum -y autoremove" "yum -y autoremove" "yum -y autoremove" "" "" "pkg autoremove")
 CMD=("$(grep -i pretty_name /etc/os-release 2>/dev/null | cut -d \" -f2)" "$(hostnamectl 2>/dev/null | grep -i system | cut -d : -f2)" "$(lsb_release -sd 2>/dev/null)" "$(grep -i description /etc/lsb-release 2>/dev/null | cut -d \" -f2)" "$(grep . /etc/redhat-release 2>/dev/null)" "$(grep . /etc/issue 2>/dev/null | cut -d \\ -f1 | sed '/^[ ]*$/d')" "$(grep -i pretty_name /etc/os-release 2>/dev/null | cut -d \" -f2)" "$(uname -s)")
 SYS="${CMD[0]}"
@@ -90,7 +97,8 @@ checkupdate() {
             public_keys=$(grep -oE 'NO_PUBKEY [0-9A-F]+' "$temp_file_apt_fix" | awk '{ print $2 }')
             joined_keys=$(echo "$public_keys" | paste -sd " ")
             echo "No Public Keys: ${joined_keys}"
-            apt-key adv --keyserver keyserver.ubuntu.com --recv-keys ${joined_keys}
+            read -r -a key_args <<< "$joined_keys"
+            apt-key adv --keyserver keyserver.ubuntu.com --recv-keys "${key_args[@]}"
             apt-get update
             if [ $? -eq 0 ]; then
                 _green "Fixed"
@@ -114,19 +122,20 @@ install_required_modules() {
         fi
 
         if command -v apt-get >/dev/null 2>&1; then
-            if command -v $module >/dev/null 2>&1; then
+            if command -v "$module" >/dev/null 2>&1; then
                 echo "$module is installed!"
                 echo "$module 已经安装！"
             else
-                apt-get install -y $module
+                apt-get install -y "$module"
                 if [ $? -ne 0 ]; then
-                    apt-get install -y $module --fix-missing
+                    apt-get install -y "$module" --fix-missing
                 fi
                 echo "$module has tried to install!"
                 echo "$module 已尝试过安装！"
             fi
         else
-            ${PACKAGE_INSTALL[int]} $module 2>/dev/null || {
+            read -r -a install_cmd <<< "${PACKAGE_INSTALL[int]}"
+            "${install_cmd[@]}" "$module" 2>/dev/null || {
                 # 如果安装失败且是Alpine系统，尝试备选包
                 if [ "$SYSTEM" = "Alpine" ] && [ "$module" = "dos2unix" ]; then
                     apk add --no-cache busybox-extras
@@ -176,7 +185,7 @@ if [ -f "/etc/selinux/config" ]; then
     sudo sed -i.bak '/^SELINUX=/cSELINUX=disabled' /etc/selinux/config
 fi
 sudo setenforce 0
-echo root:"$1" | sudo chpasswd root
+printf 'root:%s\n' "$1" | sudo chpasswd
 update_sshd_config() {
     local config_file="$1"
     if [ -f "$config_file" ]; then
@@ -215,4 +224,4 @@ do
 done
 service_manager restart ssh
 service_manager restart sshd
-rm -rf "$0"
+rm -f -- "$0"
