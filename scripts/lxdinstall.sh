@@ -23,7 +23,7 @@
 #   CN=true                    强制使用中国镜像
 
 cd /root >/dev/null 2>&1 || exit 1
-REGEX=("debian|astra" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazon linux'" "fedora" "arch|manjaro" "alpine" "freebsd")
+REGEX=("debian|astra" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "amazon[[:space:]]+linux" "fedora" "arch|manjaro" "alpine" "freebsd")
 RELEASE=("Debian" "Ubuntu" "CentOS" "CentOS" "Fedora" "Arch" "Alpine" "FreeBSD")
 CMD=("$(grep -i pretty_name /etc/os-release 2>/dev/null | cut -d \" -f2)" "$(hostnamectl 2>/dev/null | grep -i system | cut -d : -f2)" "$(lsb_release -sd 2>/dev/null)" "$(grep -i description /etc/lsb-release 2>/dev/null | cut -d \" -f2)" "$(grep . /etc/redhat-release 2>/dev/null)" "$(grep . /etc/issue 2>/dev/null | cut -d \\ -f1 | sed '/^[ ]*$/d')" "$(grep -i pretty_name /etc/os-release 2>/dev/null | cut -d \" -f2)" "$(uname -s)")
 SYS="${CMD[0]}"
@@ -53,6 +53,13 @@ storage_pool_exists() {
     /snap/bin/lxc storage show "$pool_name" >/dev/null 2>&1
 }
 
+# `lxc query` returns an API envelope on real daemons while test doubles and
+# older wrappers may return the metadata object directly.  Normalize both
+# forms before inspecting profile/network fields.
+api_metadata() {
+    jq -c 'if type == "object" and ((.metadata? | type) == "object") then .metadata else . end'
+}
+
 valid_storage_pool_name() {
     [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]
 }
@@ -66,9 +73,27 @@ active_storage_pool() {
             return 0
         fi
     fi
+    # Prefer the pool referenced by an existing default profile, including
+    # common names such as "local". Do not reinitialize a partially set up host.
+    pool_name=$(/snap/bin/lxc query /1.0/profiles/default 2>/dev/null | api_metadata |
+        jq -r '[.devices[]? | select(.type == "disk" and .path == "/") | .pool // empty] | if length == 1 then .[0] else empty end' 2>/dev/null)
+    if valid_storage_pool_name "$pool_name" && storage_pool_exists "$pool_name"; then
+        printf '%s\n' "$pool_name"
+        return 0
+    fi
     if storage_pool_exists default; then
         printf '%s\n' default
         return 0
+    fi
+    local pools
+    pools=$(/snap/bin/lxc storage list --format csv -c n) || return 2
+    if [ -n "$pools" ]; then
+        if [[ "$pools" != *$'\n'* ]] && valid_storage_pool_name "$pools" && storage_pool_exists "$pools"; then
+            printf '%s\n' "$pools"
+            return 0
+        fi
+        _red "Multiple storage pools exist; set STORAGE_POOL_FILE to the pool to reuse" >&2
+        return 2
     fi
     return 1
 }
@@ -295,35 +320,81 @@ set_locale() {
 }
 
 install_package() {
-    package_name=$1
+    local package_name="$1"
+    local status=0
     if command -v "$package_name" >/dev/null 2>&1; then
         _green "$package_name has been installed"
         _green "$package_name 已经安装"
+        return 0
     else
         if [ "$SYSTEM" = "Alpine" ] && command -v apk >/dev/null 2>&1; then
-            apk add --no-cache "$package_name"
+            apk add --no-cache "$package_name" || status=$?
         elif [ "$SYSTEM" = "Arch" ] && command -v pacman >/dev/null 2>&1; then
-            pacman -S --noconfirm --needed "$package_name"
+            pacman -S --noconfirm --needed "$package_name" || status=$?
         elif command -v apt-get >/dev/null 2>&1; then
-            apt-get install -y "$package_name"
-            if [ $? -ne 0 ]; then
-                apt-get install -y "$package_name" --fix-missing
+            if ! apt-get install -y "$package_name"; then
+                apt-get install -y "$package_name" --fix-missing || status=$?
             fi
         elif command -v yum >/dev/null 2>&1; then
-            yum install -y "$package_name"
+            yum install -y "$package_name" || status=$?
         elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y "$package_name"
+            dnf install -y "$package_name" || status=$?
         elif command -v apk >/dev/null 2>&1; then
-            apk add --no-cache "$package_name"
+            apk add --no-cache "$package_name" || status=$?
         elif command -v pacman >/dev/null 2>&1; then
-            pacman -S --noconfirm --needed "$package_name"
+            pacman -S --noconfirm --needed "$package_name" || status=$?
         else
             _yellow "No supported package manager found"
             _yellow "未找到支持的包管理器"
             return 1
         fi
+        if [ "$status" -ne 0 ]; then
+            _red "Failed to install $package_name"
+            _red "$package_name 安装失败"
+            return "$status"
+        fi
         _green "$package_name has attempted to install"
         _green "$package_name 已尝试安装"
+    fi
+}
+
+# Other vendor sysctl files can contain unsupported optional keys. Validate
+# the forwarding file we own and the effective value before declaring ready.
+apply_forwarding_config() {
+    local config_file="$1"
+    if sysctl --help 2>&1 | grep -q -- '--system'; then
+        if ! sysctl --system >/dev/null 2>&1; then
+            sysctl -p "$config_file" >/dev/null 2>&1 || return 1
+        fi
+    else
+        sysctl -p "$config_file" >/dev/null 2>&1 || return 1
+    fi
+    [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" = "1" ] || {
+        _red "Required IPv4 forwarding is not enabled"
+        return 1
+    }
+}
+
+# uidmap is a Debian package name; other distributions use shadow packages.
+install_uidmap() {
+    if command -v newuidmap >/dev/null 2>&1 && command -v newgidmap >/dev/null 2>&1; then
+        return 0
+    fi
+    if command -v apt-get >/dev/null 2>&1; then
+        install_package uidmap || return 1
+    elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+        install_package shadow-utils || return 1
+    elif command -v apk >/dev/null 2>&1; then
+        install_package shadow-uidmap || install_package shadow || return 1
+    elif command -v pacman >/dev/null 2>&1; then
+        install_package shadow || return 1
+    else
+        _red "No supported package manager found for uidmap"
+        return 1
+    fi
+    if ! command -v newuidmap >/dev/null 2>&1 || ! command -v newgidmap >/dev/null 2>&1; then
+        _red "newuidmap/newgidmap are still unavailable after package installation"
+        return 1
     fi
 }
 
@@ -419,58 +490,91 @@ get_available_space() {
 
 install_base_packages() {
     if [ "$SYSTEM" = "Alpine" ] && command -v apk >/dev/null 2>&1; then
-        apk update
+        apk update || return 1
     elif [ "$SYSTEM" = "Arch" ] && command -v pacman >/dev/null 2>&1; then
-        pacman -Sy
+        pacman -Sy || return 1
     elif command -v apt-get >/dev/null 2>&1; then
-        apt-get update
-        apt-get autoremove -y
+        apt-get update || return 1
     elif command -v yum >/dev/null 2>&1; then
-        yum update -y
+        yum update -y || return 1
     elif command -v dnf >/dev/null 2>&1; then
-        dnf update -y
+        dnf update -y || return 1
     fi
-    install_package wget
-    install_package curl
-    install_package sudo
+    install_package wget || return 1
+    install_package curl || return 1
+    install_package sudo || return 1
     if [ "$SYSTEM" = "Alpine" ]; then
-        install_package dos2unix || apk add --no-cache busybox-extras
+        install_package dos2unix || apk add --no-cache busybox-extras || return 1
     else
-        install_package dos2unix
+        install_package dos2unix || return 1
     fi
     install_package ufw || _yellow "ufw not available on this system"
-    install_package jq
-    install_package uidmap || _yellow "uidmap not available on this system"
+    install_package jq || return 1
+    install_uidmap || return 1
     if [ "$SYSTEM" = "Alpine" ]; then
-        install_package ipcalc || apk add --no-cache ipcalc-ng
+        install_package ipcalc || apk add --no-cache ipcalc-ng || return 1
     else
-        install_package ipcalc
+        install_package ipcalc || return 1
     fi
-    install_package unzip
+    install_package unzip || return 1
 }
 
 install_lxd() {
-    lxd_snap=$(dpkg -l | awk '/^[hi]i/{print $2}' | grep -ow snap)
-    lxd_snapd=$(dpkg -l | awk '/^[hi]i/{print $2}' | grep -ow snapd)
-    if [[ "$lxd_snap" =~ ^snap.* ]] && [[ "$lxd_snapd" =~ ^snapd.* ]]; then
-        _green "snap is installed"
-        _green "snap已安装"
-    else
-        _green "start installation of snap"
-        _green "开始安装snap"
-        apt-get update
-        install_package snapd
+    # A clean Debian/Ubuntu host has no snap command yet.  Bootstrap snapd
+    # before inspecting or installing the LXD snap; otherwise the installer
+    # rejects the exact fresh hosts it is meant to support.
+    if ! command -v snap >/dev/null 2>&1; then
+        command -v apt-get >/dev/null 2>&1 || {
+            _red "snap is unavailable and apt-get cannot bootstrap snapd"
+            return 1
+        }
+        apt-get update || return 1
+        install_package snapd || return 1
+        if command -v systemctl >/dev/null 2>&1 &&
+           systemctl list-unit-files snapd.socket >/dev/null 2>&1; then
+            systemctl enable --now snapd.socket >/dev/null 2>&1 || {
+                _red "无法启动 snapd.socket，LXD snap 无法继续安装"
+                return 1
+            }
+        fi
     fi
-    snap_core=$(snap list core)
-    snap_lxd=$(snap list lxd)
-    if [[ "$snap_core" =~ core.* ]] && [[ "$snap_lxd" =~ lxd.* ]]; then
+    command -v snap >/dev/null 2>&1 || {
+        _red "snapd installation did not provide the snap command"
+        return 1
+    }
+    if command -v systemctl >/dev/null 2>&1; then
+        local snap_ready=false
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if snap list >/dev/null 2>&1; then
+                snap_ready=true
+                break
+            fi
+            sleep 1
+        done
+        if [ "$snap_ready" != true ]; then
+            _red "snapd daemon is not ready"
+            return 1
+        fi
+    fi
+    snap_core=$(snap list core 2>/dev/null || true)
+    snap_lxd=$(snap list lxd 2>/dev/null || true)
+    if [[ "$snap_lxd" =~ (^|[[:space:]])lxd([[:space:]]|$) ]]; then
         _green "lxd is installed"
         _green "lxd已安装"
-        ensure_lxc_path
-        lxd_lxc_detect=$(lxc list)
-        if [[ "$lxd_lxc_detect" =~ "snap-update-ns failed with code1".* ]]; then
-            service_manager restart apparmor
-            snap restart lxd
+        ensure_lxc_path || return 1
+        local lxd_lxc_detect
+        if ! lxd_lxc_detect=$(lxc list 2>&1); then
+            if [[ "$lxd_lxc_detect" =~ snap-update-ns[[:space:]]+failed[[:space:]]+with[[:space:]]+code[[:space:]]*1 ]]; then
+                service_manager restart apparmor || return 1
+                snap restart lxd || return 1
+                lxc list >/dev/null 2>&1 || return 1
+            else
+                _red "LXD environment check failed: $lxd_lxc_detect"
+                return 1
+            fi
+        elif [[ "$lxd_lxc_detect" =~ snap-update-ns[[:space:]]+failed[[:space:]]+with[[:space:]]+code[[:space:]]*1 ]]; then
+            service_manager restart apparmor || return 1
+            snap restart lxd || return 1
         else
             _green "No problems with environmental testing"
             _green "环境检测无问题"
@@ -478,21 +582,25 @@ install_lxd() {
     else
         _green "Start installation of LXD"
         _green "开始安装LXD"
-        snap install lxd
-        if [[ $? -ne 0 ]]; then
-            snap remove lxd
-            snap install core
-            snap install lxd
+        if ! snap install lxd; then
+            # Installing core is a compatibility fallback for old snap
+            # stores.  Never remove an existing snap here: that can delete a
+            # live LXD data directory while recovering a transient store
+            # error.
+            snap install core || return 1
+            snap install lxd || return 1
         fi
-        ensure_lxc_path
-        ! lxc -h >/dev/null 2>&1 && _yellow 'lxc路径有问题，请检查修复' && exit 1
+        ensure_lxc_path || return 1
+        ! lxc -h >/dev/null 2>&1 && _yellow 'lxc路径有问题，请检查修复' && return 1
         _green "LXD installation complete"
         _green "LXD安装完成"
     fi
-    snap set lxd lxcfs.loadavg=true
-    snap set lxd lxcfs.pidfd=true
-    snap set lxd lxcfs.cfs=true
-    restart_lxd_daemon_safely || exit 1
+    snap set lxd lxcfs.loadavg=true || return 1
+    snap set lxd lxcfs.pidfd=true || return 1
+    snap set lxd lxcfs.cfs=true || return 1
+    restart_lxd_daemon_safely || return 1
+    command -v lxc >/dev/null 2>&1 || return 1
+    lxc --version >/dev/null 2>&1 || return 1
 }
 
 configure_resources() {
@@ -689,7 +797,7 @@ create_storage_pool_with_custom_path() {
         _yellow "An existing $pool_name storage pool was found; preserving and reusing it"
         return 0
     fi
-    mkdir -p "$storage_path"
+    mkdir -p "$storage_path" || return 1
     if [ "$backend" = "lvm" ]; then
         loop_file="$storage_path/lvm_pool.img"
         _green "创建 LVM 存储池..."
@@ -704,12 +812,12 @@ create_storage_pool_with_custom_path() {
             return 1
         fi
         _green "设置循环设备..."
-        loop_dev=$(losetup -f)
-        losetup "$loop_dev" "$loop_file"
+        loop_dev=$(losetup -f) || return 1
+        losetup "$loop_dev" "$loop_file" || return 1
         _green "创建 LVM 物理卷和卷组..."
-        pvcreate "$loop_dev" >/dev/null 2>&1
-        vgcreate lxd_vg "$loop_dev" >/dev/null 2>&1
-        echo "$loop_file" > "$storage_path/lvm_loop_file.txt"
+        pvcreate "$loop_dev" >/dev/null 2>&1 || return 1
+        vgcreate lxd_vg "$loop_dev" >/dev/null 2>&1 || return 1
+        printf '%s\n' "$loop_file" > "$storage_path/lvm_loop_file.txt" || return 1
         temp=$(/snap/bin/lxc storage create "$pool_name" lvm source=lxd_vg 2>&1)
         status=$?
     elif [ "$backend" = "btrfs" ]; then
@@ -727,7 +835,7 @@ create_storage_pool_with_custom_path() {
             _red "Existing btrfs loop file found; refusing to overwrite: $loop_file"
             return 1
         fi
-        mkdir -p "$mount_point"
+        mkdir -p "$mount_point" || return 1
         _green "创建稀疏文件：$loop_file (${disk_nums}GB)..."
         if ! create_sparse_file "$loop_file" "$disk_nums"; then
             return 1
@@ -740,18 +848,22 @@ create_storage_pool_with_custom_path() {
             return 1
         fi
         _green "挂载 btrfs 文件系统..."
-        mount -o loop "$loop_file" "$mount_point"
-        if [ $? -ne 0 ]; then
+        if ! mount -o loop "$loop_file" "$mount_point"; then
             _red "挂载失败"
             _red "Mount failed"
             return 1
         fi
         if ! grep -Fq "$loop_file" /etc/fstab 2>/dev/null; then
-            echo "$loop_file $mount_point btrfs loop 0 0" >>/etc/fstab
+            if ! printf '%s\n' "$loop_file $mount_point btrfs loop 0 0" >>/etc/fstab; then
+                _red "无法写入 /etc/fstab，取消 btrfs 存储池创建"
+                umount "$mount_point" 2>/dev/null || true
+                rm -f -- "$loop_file"
+                return 1
+            fi
             _green "已添加到 /etc/fstab 实现开机自动挂载"
             _green "Added to /etc/fstab for automatic mounting on boot"
         fi
-        chmod 711 "$mount_point"
+        chmod 711 "$mount_point" || return 1
         temp=$(/snap/bin/lxc storage create "$pool_name" btrfs source="$mount_point" 2>&1)
         status=$?
     elif [ "$backend" = "zfs" ]; then
@@ -774,7 +886,7 @@ create_storage_pool_with_custom_path() {
             return 1
         fi
         _green "创建 ZFS pool..."
-        zpool create -f "$zpool_name" "$loop_file" >/dev/null 2>&1
+        zpool create -f "$zpool_name" "$loop_file" >/dev/null 2>&1 || return 1
         if ! zpool list "$zpool_name" >/dev/null 2>&1; then
             _red "ZFS pool 创建失败！"
             _red "ZFS pool creation failed!"
@@ -803,7 +915,7 @@ execute_storage_init() {
     if existing_pool=$(active_storage_pool); then
         _yellow "检测到现有 $existing_pool 存储池，将保留并复用它"
         _yellow "An existing $existing_pool storage pool was found; preserving and reusing it"
-        record_storage_pool "$existing_pool"
+        record_storage_pool "$existing_pool" || return 1
         echo "Existing $existing_pool storage pool preserved"
         return 0
     fi
@@ -811,7 +923,11 @@ execute_storage_init() {
         # Initialize the daemon without deleting the default pool that the
         # automatic initializer may create. The requested custom path is used
         # by a separate managed pool and build scripts select that pool later.
-        if ! /snap/bin/lxd init --auto 2>/dev/null; then
+        local init_output init_status
+        init_output=$(/snap/bin/lxd init --auto 2>&1)
+        init_status=$?
+        if [ "$init_status" -ne 0 ] && ! grep -Eiq 'already[[:space:]]+(been[[:space:]]+)?initialized|already[[:space:]]+exists|already[[:space:]]+configured' <<<"$init_output"; then
+            printf '%s\n' "$init_output" >&2
             _red "LXD 初始化失败，无法创建自定义存储池"
             _red "LXD initialization failed; cannot create the custom storage pool"
             return 1
@@ -822,19 +938,18 @@ execute_storage_init() {
         if storage_pool_exists "$MANAGED_STORAGE_POOL"; then
             _yellow "检测到已有 $MANAGED_STORAGE_POOL 存储池，将保留并复用它"
             _yellow "An existing $MANAGED_STORAGE_POOL storage pool was found; preserving and reusing it"
-            record_storage_pool "$MANAGED_STORAGE_POOL"
+            record_storage_pool "$MANAGED_STORAGE_POOL" || return 1
             echo "Existing $MANAGED_STORAGE_POOL storage pool preserved"
             return 0
         fi
         if create_storage_pool_with_custom_path "$backend" "$storage_path" "$disk_nums" "$MANAGED_STORAGE_POOL"; then
             temp="Storage pool created successfully"
             status=0
-            record_storage_pool "$MANAGED_STORAGE_POOL"
-            if ! /snap/bin/lxc network list 2>/dev/null | grep -q lxdbr0; then
-                _yellow "网络未初始化，正在初始化网络配置..."
-                _yellow "Network not initialized, initializing network configuration..."
-                /snap/bin/lxd init --auto >/dev/null 2>&1 || true
-            fi
+            record_storage_pool "$MANAGED_STORAGE_POOL" || return 1
+            # Network and profile repair is performed by
+            # ensure_runtime_network after storage setup. Do not invoke a
+            # second `lxd init --auto` here, because it can fail or rewrite
+            # administrator settings on a partially initialized daemon.
         else
             temp="Failed to create storage pool with custom path"
             status=1
@@ -847,7 +962,7 @@ execute_storage_init() {
         fi
         status=$?
         if [ "$status" -eq 0 ] && storage_pool_exists default; then
-            record_storage_pool default
+            record_storage_pool default || return 1
         fi
     fi
     echo "$temp"
@@ -878,7 +993,7 @@ init_storage_backend() {
     if [ "$backend" = "btrfs" ] && ! is_storage_installed "btrfs" && ! command -v btrfs >/dev/null; then
         _yellow "正在安装 btrfs-progs..."
         _yellow "Installing btrfs-progs..."
-        install_package btrfs-progs
+        install_package btrfs-progs || return 1
         record_installed_storage "btrfs"
         modprobe btrfs || true
         _green "无法加载btrfs模块。请重启本机再次执行本脚本以加载btrfs内核。"
@@ -888,7 +1003,7 @@ init_storage_backend() {
     elif [ "$backend" = "lvm" ] && ! is_storage_installed "lvm" && ! command -v lvm >/dev/null; then
         _yellow "正在安装 lvm2..."
         _yellow "Installing lvm2..."
-        install_package lvm2
+        install_package lvm2 || return 1
         record_installed_storage "lvm"
         modprobe dm-mod || true
         _green "无法加载LVM模块。请重启本机再次执行本脚本以加载LVM内核。"
@@ -898,7 +1013,7 @@ init_storage_backend() {
     elif [ "$backend" = "zfs" ] && ! is_storage_installed "zfs" && ! command -v zfs >/dev/null; then
         _yellow "正在安装 zfsutils-linux..."
         _yellow "Installing zfsutils-linux..."
-        install_package zfsutils-linux
+        install_package zfsutils-linux || return 1
         record_installed_storage "zfs"
         modprobe zfs || true
         _green "无法加载ZFS模块。请重启本机再次执行本脚本以加载ZFS内核。"
@@ -908,7 +1023,7 @@ init_storage_backend() {
     elif [ "$backend" = "ceph" ] && ! is_storage_installed "ceph" && ! command -v ceph >/dev/null; then
         _yellow "正在安装 ceph-common..."
         _yellow "Installing ceph-common..."
-        install_package ceph-common
+        install_package ceph-common || return 1
         record_installed_storage "ceph"
     fi
     if [ "$backend" = "btrfs" ] && is_storage_installed "btrfs" && ! grep -q btrfs /proc/filesystems; then
@@ -919,7 +1034,10 @@ init_storage_backend() {
         modprobe zfs || true
     fi
     if [ "$need_reboot" = true ]; then
-        exit 1
+        # Keep the reboot marker for a later retry, while allowing the caller
+        # to fall back to another backend in this run. A missing optional
+        # kernel module must not leave an otherwise usable LXD host half set up.
+        return 1
     fi
     local temp
     temp=$(execute_storage_init "$backend")
@@ -946,12 +1064,15 @@ init_storage_backend() {
 }
 
 setup_storage() {
-    local existing_pool
+    local existing_pool pool_status
     if existing_pool=$(active_storage_pool); then
         _green "检测到现有 $existing_pool 存储池，跳过后端重新初始化"
         _green "An existing $existing_pool storage pool was found; skipping backend reinitialization"
-        record_storage_pool "$existing_pool"
+        record_storage_pool "$existing_pool" || return 1
         return 0
+    else
+        pool_status=$?
+        [ "$pool_status" -eq 1 ] || return "$pool_status"
     fi
     if [ -f "/usr/local/bin/lxd_reboot" ]; then
         REBOOT_BACKEND=$(cat /usr/local/bin/lxd_reboot)
@@ -981,15 +1102,118 @@ setup_storage() {
     execute_storage_init dir
 }
 
+# Storage initialization can be skipped on a reused host; profile and network
+# initialization must still run. Only add missing devices/settings and preserve
+# existing pools, custom NICs, addresses and explicit IPv6 disablement.
+ensure_runtime_network() {
+    local pool profiles profile roots root_pool nics nic network bridge="lxdbr0" networks config value
+    command -v jq >/dev/null 2>&1 || { _red "jq is required to verify initialization"; return 1; }
+    lxc info >/dev/null 2>&1 || { _red "LXD daemon is unavailable"; return 1; }
+    pool=$(active_storage_pool) || { _red "No unambiguous usable storage pool"; return 1; }
+    profiles=$(lxc profile list --format csv -c n) || return 1
+    if ! grep -Fxq default <<< "$profiles"; then
+        lxc profile create default || return 1
+    fi
+    profile=$(lxc query /1.0/profiles/default | api_metadata) || return 1
+    roots=$(jq -er '[.devices // {} | to_entries[] | select(.value.type == "disk" and .value.path == "/")] | length' <<< "$profile") || return 1
+    if [ "$roots" -eq 0 ]; then
+        if jq -e '.devices.root != null' <<< "$profile" >/dev/null; then
+            _red "default profile device root is already used; leaving it unchanged"
+            return 1
+        fi
+        lxc profile device add default root disk path=/ pool="$pool" || return 1
+    elif [ "$roots" -eq 1 ]; then
+        root_pool=$(jq -r '.devices[] | select(.type == "disk" and .path == "/") | .pool // empty' <<< "$profile")
+        if [ -z "$root_pool" ] || ! storage_pool_exists "$root_pool"; then
+            _red "default profile root refers to an unavailable pool; leaving it unchanged"
+            return 1
+        fi
+    else
+        _red "default profile has multiple root disks; leaving it unchanged"
+        return 1
+    fi
+
+    nics=$(jq -er '[.devices // {} | to_entries[] | select(.value.type == "nic")] | length' <<< "$profile") || return 1
+    if [ "$nics" -gt 0 ]; then
+        # Custom NIC layouts are user configuration. Validate their referenced
+        # resources without replacing them with the installer's default bridge.
+        while IFS= read -r nic; do
+            network=$(jq -r '.network // empty' <<< "$nic")
+            if [ "$network" = "$bridge" ]; then
+                continue # A missing installer bridge is repaired below.
+            elif [ "$network" = "none" ]; then
+                # `none` is a valid explicit LXD profile choice; preserve it
+                # without looking for a network object of that name.
+                continue
+            elif [ -n "$network" ]; then
+                lxc network show "$network" >/dev/null || return 1
+            else
+                network=$(jq -r '.parent // empty' <<< "$nic")
+                [ -z "$network" ] || [ "$network" = "$bridge" ] || ip link show dev "$network" >/dev/null || return 1
+            fi
+        done < <(jq -c '.devices[] | select(.type == "nic")' <<< "$profile")
+        if ! jq -e --arg bridge "$bridge" '.devices[] | select(.type == "nic" and (.network == $bridge or .parent == $bridge))' <<< "$profile" >/dev/null; then
+            _yellow "Preserving the custom default-profile network; ensuring the installer bridge separately"
+        fi
+    elif jq -e '.devices.eth0 != null' <<< "$profile" >/dev/null; then
+        _red "default profile device eth0 is already used; leaving it unchanged"
+        return 1
+    fi
+
+    networks=$(lxc network list --format csv -c n) || return 1
+    if ! grep -Fxq "$bridge" <<< "$networks"; then
+        if ip link show dev "$bridge" >/dev/null 2>&1; then
+            _red "$bridge already exists outside LXD; refusing to replace it"
+            return 1
+        fi
+        # IPv4 is required for the default NAT setup. IPv6 is optional.
+        lxc network create "$bridge" ipv4.address=auto ipv4.nat=true ipv4.dhcp=true ipv6.address=none || return 1
+        lxc network set "$bridge" ipv6.address auto || _yellow "IPv6 unavailable; retaining IPv4 networking"
+    fi
+    config=$(lxc query "/1.0/networks/$bridge" | api_metadata) || return 1
+    jq -e '.type == "bridge" and .managed == true' <<< "$config" >/dev/null || {
+        _red "$bridge is not a managed bridge"; return 1;
+    }
+    for value in ipv4.address ipv4.dhcp ipv4.nat; do
+        network=$(jq -r --arg key "$value" '.config[$key] // empty' <<< "$config") || return 1
+        if [ -z "$network" ]; then
+            if [ "$value" = ipv4.address ]; then
+                lxc network set "$bridge" "$value" auto || return 1
+            else
+                lxc network set "$bridge" "$value" true || return 1
+            fi
+        elif { [ "$value" = ipv4.address ] && [ "$network" = none ]; } ||
+             { [ "$value" = ipv4.dhcp ] && [ "$network" = false ]; }; then
+            _red "$bridge explicitly disables $value; default IPv4 NAT is unavailable (setting preserved)"
+            return 1
+        fi
+    done
+    if [ "$nics" -eq 0 ]; then
+        lxc profile device add default eth0 nic network="$bridge" name=eth0 || return 1
+    fi
+    # LXD can acknowledge a managed network just before the bridge appears in
+    # the host link table. Wait briefly for the kernel interface to settle.
+    local link_attempt=0
+    while ! ip link show dev "$bridge" >/dev/null 2>&1; do
+        link_attempt=$((link_attempt + 1))
+        if [ "$link_attempt" -ge 10 ]; then
+            _red "$bridge has no host interface"
+            return 1
+        fi
+        sleep 1
+    done
+    _green "LXD storage, default profile and $bridge are ready"
+}
+
 configure_lxd_network() {
     ensure_lxc_path
-    ! lxc -h >/dev/null 2>&1 && _yellow '使用 lxc -h 检测到路径有问题，请手动查看LXD是否安装成功' && exit 1
-    lxc config unset images.auto_update_interval
-    lxc config set images.auto_update_interval 0
+    ensure_runtime_network || return 1
+    lxc config set images.auto_update_interval 0 || return 1
     if ! lxc remote list 2>/dev/null | grep -q '^| opsmaru[[:space:]]*|'; then
-        lxc remote add opsmaru https://images.opsmaru.dev/spaces/9bfad87bd318b8f06012059a --public --protocol simplestreams
+        lxc remote add opsmaru https://images.opsmaru.dev/spaces/9bfad87bd318b8f06012059a --public --protocol simplestreams ||
+            _yellow "Optional image remote opsmaru is unavailable"
     fi
-    lxc network set lxdbr0 ipv6.address auto
+    return 0
 }
 
 download_preset_files() {
@@ -1002,17 +1226,18 @@ download_preset_files() {
     for file in "${files[@]}"; do
         filename=$(basename "$file")
         rm -f -- "$filename"
-        download_file "$file" "$filename"
-        chmod 777 "$filename"
-        dos2unix "$filename"
+        download_file "$file" "$filename" || return 1
+        chmod 755 "$filename" || return 1
+        dos2unix "$filename" || return 1
     done
-    cp /root/ssh_sh.sh /usr/local/bin
-    cp /root/ssh_bash.sh /usr/local/bin
-    cp /root/config.sh /usr/local/bin
+    cp /root/ssh_sh.sh /usr/local/bin || return 1
+    cp /root/ssh_bash.sh /usr/local/bin || return 1
+    cp /root/config.sh /usr/local/bin || return 1
 }
 
 configure_system() {
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    command -v sysctl >/dev/null 2>&1 || return 1
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null || return 1
     SYSCTL_CONF="/etc/sysctl.conf"
     SYSCTL_D_CONF="/etc/sysctl.d/99-custom.conf"
     if [ -f "$SYSCTL_CONF" ]; then
@@ -1022,23 +1247,16 @@ configure_system() {
             echo "net.ipv4.ip_forward=1" >>"$SYSCTL_CONF"
         fi
     fi
-    mkdir -p /etc/sysctl.d
+    mkdir -p /etc/sysctl.d || return 1
     if ! grep -q "^net.ipv4.ip_forward=1" "$SYSCTL_D_CONF" 2>/dev/null; then
-        echo "net.ipv4.ip_forward=1" >>"$SYSCTL_D_CONF"
+        echo "net.ipv4.ip_forward=1" >>"$SYSCTL_D_CONF" || return 1
     fi
-    if sysctl --system >/dev/null 2>&1; then
-        sysctl --system >/dev/null
-    else
-        sysctl -p "$SYSCTL_CONF" >/dev/null 2>&1
-        sysctl -p "$SYSCTL_D_CONF" >/dev/null 2>&1
-    fi
-    lxc network set lxdbr0 raw.dnsmasq dhcp-option=6,8.8.8.8,8.8.4.4
-    lxc network set lxdbr0 dns.mode managed
-    lxc network set lxdbr0 ipv4.dhcp true
-    lxc network set lxdbr0 ipv6.dhcp true
+    apply_forwarding_config "$SYSCTL_D_CONF" || return 1
+    # Required network settings are validated by ensure_runtime_network.
+    # Preserve custom DNS, addressing and explicit IPv6 disablement here.
     # Ensure root has subuid/subgid entries for unprivileged containers
-    grep -q "^root:" /etc/subuid 2>/dev/null || echo 'root:100000:65536' >>/etc/subuid
-    grep -q "^root:" /etc/subgid 2>/dev/null || echo 'root:100000:65536' >>/etc/subgid
+    grep -q "^root:" /etc/subuid 2>/dev/null || echo 'root:100000:65536' >>/etc/subuid || return 1
+    grep -q "^root:" /etc/subgid 2>/dev/null || echo 'root:100000:65536' >>/etc/subgid || return 1
 }
 
 remove_system_limits() {
@@ -1055,22 +1273,28 @@ remove_system_limits() {
             echo 'UserTasksMax=infinity' | sudo tee -a /etc/systemd/logind.conf
         fi
     fi
-    ufw disable
+    if command -v ufw >/dev/null 2>&1; then
+        ufw disable || _yellow "Unable to disable ufw; verify firewall rules manually"
+    fi
 }
 
 install_dns_check() {
+    if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
+        _yellow "No systemd installation detected; skipping optional DNS checker"
+        return 0
+    fi
     if [ ! -f /usr/local/bin/check-dns.sh ]; then
-        download_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/check-dns.sh" /usr/local/bin/check-dns.sh
-        chmod +x /usr/local/bin/check-dns.sh
+        download_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/check-dns.sh" /usr/local/bin/check-dns.sh || return 1
+        chmod +x /usr/local/bin/check-dns.sh || return 1
     else
         echo "Script already exists. Skipping installation."
     fi
     if [ ! -f /etc/systemd/system/check-dns.service ]; then
-        download_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/check-dns.service" /etc/systemd/system/check-dns.service
-        chmod +x /etc/systemd/system/check-dns.service
-        service_manager daemon-reload
-        service_manager enable check-dns.service
-        service_manager start check-dns.service
+        download_file "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/check-dns.service" /etc/systemd/system/check-dns.service || return 1
+        chmod +x /etc/systemd/system/check-dns.service || return 1
+        service_manager daemon-reload || return 1
+        service_manager enable check-dns.service || return 1
+        service_manager start check-dns.service || return 1
     else
         echo "Service already exists. Skipping installation."
     fi
@@ -1098,17 +1322,41 @@ setup_network_preferences() {
         fi
     fi
     if [ "$fw_backend" = "nft" ]; then
-        nft list table inet lxd_nat >/dev/null 2>&1 || nft add table inet lxd_nat
-        nft flush chain inet lxd_nat postrouting_masq 2>/dev/null
-        nft list chain inet lxd_nat postrouting_masq >/dev/null 2>&1 || \
-            nft 'add chain inet lxd_nat postrouting_masq { type nat hook postrouting priority 100; policy accept; }'
-        nft add rule inet lxd_nat postrouting_masq masquerade
-        nft list ruleset > /etc/nftables.conf 2>/dev/null
+        if ! nft list table inet lxd_nat >/dev/null 2>&1; then
+            nft add table inet lxd_nat || return 1
+        fi
+        if nft list chain inet lxd_nat postrouting_masq >/dev/null 2>&1; then
+            nft flush chain inet lxd_nat postrouting_masq || return 1
+        else
+            nft 'add chain inet lxd_nat postrouting_masq { type nat hook postrouting priority 100; policy accept; }' || return 1
+        fi
+        nft add rule inet lxd_nat postrouting_masq masquerade || return 1
+        # Persist only the installer-owned table. Writing `nft list ruleset`
+        # here replaces administrator rules and can capture LXD's transient
+        # interface-dependent tables before lxdbr0 exists at boot.
+        mkdir -p /etc/nftables.d || return 1
+        local nft_file=/etc/nftables.d/oneclickvirt-lxd.nft
+        {
+            echo '#!/usr/sbin/nft -f'
+            nft list table inet lxd_nat
+        } > "$nft_file" || return 1
+        chmod 644 "$nft_file" || return 1
+        if [ -f /etc/nftables.conf ]; then
+            if ! grep -qF 'include "/etc/nftables.d/oneclickvirt-lxd.nft"' /etc/nftables.conf 2>/dev/null &&
+               ! grep -qF 'include "/etc/nftables.d/*.nft"' /etc/nftables.conf 2>/dev/null; then
+                echo 'include "/etc/nftables.d/oneclickvirt-lxd.nft"' >> /etc/nftables.conf || return 1
+            fi
+        else
+            cat > /etc/nftables.conf <<'NFTEOF' || return 1
+#!/usr/sbin/nft -f
+include "/etc/nftables.d/oneclickvirt-lxd.nft"
+NFTEOF
+        fi
         if command -v systemctl >/dev/null 2>&1; then
-            systemctl enable nftables >/dev/null 2>&1
+            systemctl enable nftables >/dev/null 2>&1 || true
         fi
     else
-        install_package iptables
+        install_package iptables || return 1
         if [ "$SYSTEM" = "Debian" ] || [ "$SYSTEM" = "Ubuntu" ]; then
             DEBIAN_FRONTEND=noninteractive install_package iptables-persistent
         elif [ "$SYSTEM" = "Alpine" ]; then
@@ -1122,9 +1370,11 @@ setup_network_preferences() {
                 install_package iptables-services 2>/dev/null || true
             fi
         fi
-        iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -j MASQUERADE
-        mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        if ! iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null; then
+            iptables -t nat -A POSTROUTING -j MASQUERADE || return 1
+        fi
+        mkdir -p /etc/iptables || return 1
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || return 1
         if command -v netfilter-persistent >/dev/null 2>&1; then
             netfilter-persistent save >/dev/null 2>&1
         fi
@@ -1142,23 +1392,25 @@ show_completion_info() {
 
 main() {
     set_locale
-    install_base_packages
+    install_base_packages || return 1
     check_cdn_file
     rebuild_cloud_init
     if command -v apt-get >/dev/null 2>&1; then
-        apt-get remove cloud-init -y
+        apt-get remove cloud-init -y || _yellow "cloud-init removal failed; continuing with existing cloud-init"
     fi
     statistics_of_run_times
-    install_lxd
-    configure_resources
+    install_lxd || return 1
+    /snap/bin/lxd waitready --timeout=120 || return 1
+    configure_resources || return 1
     load_storage_state
-    setup_storage
-    configure_lxd_network
-    download_preset_files
-    configure_system
-    remove_system_limits
-    install_dns_check
-    setup_network_preferences
+    setup_storage || return 1
+    configure_lxd_network || return 1
+    download_preset_files || return 1
+    configure_system || return 1
+    remove_system_limits || return 1
+    install_dns_check || return 1
+    setup_network_preferences || return 1
+    ensure_runtime_network || return 1
     show_completion_info
 }
 

@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Run platform branches with mocked executable availability and sysctl calls.
+set -euo pipefail
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+_red() { :; }
+_yellow() { :; }
+load_function() {
+    source <(awk -v name="$2" '$0 == name "() {" { printing=1 } printing { print } printing && /^}$/ { exit }' "$1")
+}
+for installer in "$repo_root/scripts/lxdinstall.sh" "$repo_root/panel_scripts/panel_init.sh"; do
+    load_function "$installer" install_uidmap
+    for pm in apt-get dnf yum apk pacman; do
+        for mode in fresh partial ready install_failed helper_missing alpine_fallback; do
+            (
+                mock_uid=false mock_gid=false mock_installs=()
+                [[ "$mode" != partial && "$mode" != ready ]] || mock_uid=true
+                [[ "$mode" != ready ]] || mock_gid=true
+                command() {
+                    if [[ "$1" == -v ]]; then
+                        case "$2" in
+                            newuidmap) $mock_uid; return ;;
+                            newgidmap) $mock_gid; return ;;
+                            apt-get|dnf|yum|apk|pacman) [[ "$2" == "$pm" ]]; return ;;
+                        esac
+                    fi
+                    builtin command "$@"
+                }
+                install_package() {
+                    mock_installs+=("$1")
+                    [[ "$mode" != install_failed ]] || return 1
+                    if [[ "$mode" == alpine_fallback && "$1" == shadow-uidmap ]]; then return 1; fi
+                    if [[ "$mode" != helper_missing ]]; then mock_uid=true mock_gid=true; fi
+                }
+                rc=0
+                install_uidmap || rc=$?
+                case "$mode" in
+                    ready) [[ "$rc:${#mock_installs[@]}" == 0:0 ]] || fail 'existing helpers must avoid package changes'; exit 0 ;;
+                    install_failed|helper_missing) [[ "$rc" != 0 ]] || fail "$pm/$mode must not pass"; exit 0 ;;
+                esac
+                [[ "$rc" == 0 ]] || fail "$pm/$mode should install both mapping helpers"
+                case "$pm" in
+                    apt-get) expected=uidmap ;;
+                    dnf|yum) expected=shadow-utils ;;
+                    apk)
+                        expected=shadow-uidmap
+                        [[ "$mode" != alpine_fallback ]] || expected='shadow-uidmap shadow' ;;
+                    pacman) expected=shadow ;;
+                esac
+                [[ "${mock_installs[*]}" == "$expected" ]] || fail "$pm/$mode installed wrong packages: ${mock_installs[*]}"
+            )
+        done
+    done
+    load_function "$installer" apply_forwarding_config
+    for scenario in success vendor_failure busybox own_file_failure forwarding_disabled; do
+        (
+            system_calls=0 file_calls=0
+            sysctl() {
+                case "$*" in
+                    --help) [[ "$scenario" == busybox ]] || printf '%s\n' --system ;;
+                    --system)
+                        system_calls=$((system_calls + 1))
+                        [[ "$scenario" != vendor_failure && "$scenario" != own_file_failure ]] ;;
+                    '-p /test/forwarding.conf')
+                        file_calls=$((file_calls + 1))
+                        [[ "$scenario" != own_file_failure ]] ;;
+                    '-n net.ipv4.ip_forward')
+                        if [[ "$scenario" == forwarding_disabled ]]; then printf '0\n'; else printf '1\n'; fi ;;
+                    *) fail "unexpected sysctl: $*" ;;
+                esac
+            }
+            rc=0
+            apply_forwarding_config /test/forwarding.conf || rc=$?
+            case "$scenario" in
+                success) [[ "$rc:$system_calls:$file_calls" == 0:1:0 ]] ;;
+                vendor_failure) [[ "$rc:$system_calls:$file_calls" == 0:1:1 ]] ;;
+                busybox) [[ "$rc:$system_calls:$file_calls" == 0:0:1 ]] ;;
+                own_file_failure) [[ "$rc:$system_calls:$file_calls" == 1:1:1 ]] ;;
+                forwarding_disabled) [[ "$rc:$system_calls:$file_calls" == 1:1:0 ]] ;;
+            esac || fail "$scenario returned $rc, system=$system_calls own-file=$file_calls"
+        )
+    done
+done
+(
+    load_function "$repo_root/scripts/lxdinstall.sh" install_dns_check
+    command() {
+        [[ "$*" != '-v systemctl' ]] || return 1
+        builtin command "$@"
+    }
+    wget() { fail 'optional systemd service must not download on OpenRC'; }
+    download_file() { fail 'optional systemd service must not download on OpenRC'; }
+    service_manager() { fail 'optional systemd service must not start on OpenRC'; }
+    install_dns_check || fail 'OpenRC must not fail on optional systemd DNS setup'
+)
+printf 'LXD package/helper and sysctl compatibility checks passed (71 scenarios)\n'

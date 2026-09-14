@@ -58,6 +58,56 @@ remove_device_if_exists() {
     lxc config device remove "$name" "$device_name" 2>/dev/null || true
 }
 
+# NAT proxies on LXD/LTS require a concrete host listener and a static NIC
+# address. Validate both before replacing any existing proxy devices.
+prepare_nat_ipv4_proxy() {
+    local host_addresses host_address metadata state binding device_name target_ip local_device
+    host_addresses=$(ip -o -4 addr show scope global) || return 1
+    ipv4_address=""
+    while read -r host_address; do
+        host_address=${host_address%/*}
+        case "$host_address" in ''|0.*|127.*|169.254.*) continue ;; esac
+        if [[ "$host_address" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            ipv4_address="$host_address"
+            break
+        fi
+    done < <(awk '{print $4}' <<<"$host_addresses")
+    if [[ -z "$ipv4_address" ]]; then
+        echo "NAT proxy requires a concrete host IPv4 address / 缺少宿主机IPv4监听地址" >&2
+        return 1
+    fi
+    metadata=$(lxc query "/1.0/instances/$name") || return 1
+    metadata=$(jq -e '(.metadata // .) | select(type == "object" and (.expanded_devices | type) == "object")' <<<"$metadata") || return 1
+    # Keep a valid existing static NIC and wildcard connect auto-selection.
+    if jq -e '[.expanded_devices[] | select(.type == "nic" and (.nictype == "bridged" or .nictype == "routed" or (.nictype == null and .network != null))) | .["ipv4.address"] | select(. != null and . != "" and . != "none")] | length > 0' <<<"$metadata" >/dev/null; then
+        return 0
+    fi
+    state=$(lxc query "/1.0/instances/$name/state") || return 1
+    state=$(jq -e '(.metadata // .) | select(type == "object" and (.network | type) == "object")' <<<"$state") || return 1
+    binding=$(jq -er --argjson state "$state" '
+        . as $instance |
+        [.expanded_devices | to_entries[] |
+         select(.value.type == "nic" and (.value.nictype == "bridged" or .value.nictype == "routed" or (.value.nictype == null and .value.network != null))) |
+         select((.value["ipv4.address"] // "") == "") | . as $device |
+         ($device.value.hwaddr // $instance.expanded_config["volatile." + $device.key + ".hwaddr"] // $instance.config["volatile." + $device.key + ".hwaddr"] // "") as $mac |
+         $state.network | to_entries[] |
+         select(if $mac != "" and (.value.hwaddr // "") != ""
+                then (.value.hwaddr | ascii_downcase) == ($mac | ascii_downcase)
+                else .key == ($device.value.name // $device.key) end) |
+         [.value.addresses[]? | select(.family == "inet" and .scope == "global") | .address][0] as $ip |
+         select($ip != null) |
+         [$device.key, $ip, ($instance.devices | has($device.key))]] |
+        if length == 1 then .[0] | @tsv else error("cannot uniquely match guest IPv4 to an instance NIC") end
+    ' <<<"$metadata") || return 1
+    IFS=$'\t' read -r device_name target_ip local_device <<<"$binding"
+    if [[ "$local_device" == true ]]; then
+        lxc config device set "$name" "$device_name" "ipv4.address=$target_ip" ||
+            lxc config device set "$name" "$device_name" ipv4.address "$target_ip" || return 1
+    else
+        lxc config device override "$name" "$device_name" "ipv4.address=$target_ip" || return 1
+    fi
+}
+
 ensure_container_ipv6_cron() {
     # shellcheck disable=SC2016
     lxc exec "$name" -- sh -c 'cron_line="*/1 * * * * curl -m 6 -s ipv6.ip.sb && curl -m 6 -s ipv6.ip.sb"; if ! crontab -l 2>/dev/null | grep -Fqx "$cron_line"; then (crontab -l 2>/dev/null; printf "%s\n" "$cron_line") | crontab -; fi'
@@ -145,7 +195,8 @@ else
     lxc exec "$name" -- bash config.sh
     lxc exec "$name" -- history -c
 fi
-replace_proxy_device ssh-port "listen=tcp:0.0.0.0:$sshn" connect=tcp:0.0.0.0:22 nat=true
+prepare_nat_ipv4_proxy || exit 1
+replace_proxy_device ssh-port "listen=tcp:$ipv4_address:$sshn" connect=tcp:0.0.0.0:22 nat=true || exit 1
 # 是否要创建V6地址
 if [ -n "$enable_ipv6" ]; then
     if [ "$enable_ipv6" == "Y" ]; then
@@ -160,8 +211,8 @@ if [ -n "$enable_ipv6" ]; then
     fi
 fi
 if [ "$nat1" != "0" ] && [ "$nat2" != "0" ]; then
-    replace_proxy_device nattcp-ports "listen=tcp:0.0.0.0:$nat1-$nat2" "connect=tcp:0.0.0.0:$nat1-$nat2" nat=true
-    replace_proxy_device natudp-ports "listen=udp:0.0.0.0:$nat1-$nat2" "connect=udp:0.0.0.0:$nat1-$nat2" nat=true
+    replace_proxy_device nattcp-ports "listen=tcp:$ipv4_address:$nat1-$nat2" "connect=tcp:0.0.0.0:$nat1-$nat2" nat=true || exit 1
+    replace_proxy_device natudp-ports "listen=udp:$ipv4_address:$nat1-$nat2" "connect=udp:0.0.0.0:$nat1-$nat2" nat=true || exit 1
 else
     remove_device_if_exists nattcp-ports
     remove_device_if_exists natudp-ports
