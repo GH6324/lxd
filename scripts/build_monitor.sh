@@ -22,4 +22,7 @@ fi
 chmod +x monitor.sh
 
 # 启动一个新的 screen 窗口并在其中运行命令
-screen -dmS lxc_monitor bash monitor.sh
+if ! screen -dmS lxc_monitor bash monitor.sh; then
+    echo "Failed to start the monitor screen session"
+    exit 1
+fi

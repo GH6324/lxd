@@ -76,6 +76,23 @@ rm -f "$LXD_STATE_DIR/lxd_ipv6_mode"
 configure_ipv6_nat66_fallback >/dev/null
 assert_eq nat66 "$(cat "$LXD_STATE_DIR/lxd_ipv6_mode")" "fallback records NAT66 mode"
 
+# A real LXD command failure must not be recorded as a successful NAT66
+# fallback.  The earlier no-command fixture only exercises state bookkeeping.
+lxc() {
+    case "$1 $2 $3 $4 $5" in
+        "config device get"*) return 1 ;;
+        "network get"*) return 1 ;;
+        "network set"*) return 1 ;;
+        *) return 1 ;;
+    esac
+}
+CONTAINER_NAME=lxd-fallback-failure
+if configure_ipv6_nat66_fallback >/dev/null 2>&1; then
+    fail "LXD NAT66 command failure was hidden"
+fi
+unset CONTAINER_NAME
+unset -f lxc
+
 # shellcheck disable=SC2329 # Called indirectly by the sourced network helpers.
 ip() {
     case "$*" in
@@ -92,6 +109,32 @@ assert_eq "he-ipv6" "$(ipv6_uplink_interface)" "explicit tunnel uplink"
 assert_eq "2606:4700::1/64" "$(ipv6_uplink_cidr he-ipv6 2606:4700::1)" "tunnel address selection"
 unset LXD_IPV6_UPLINK
 unset -f ip
+
+route_state="$LXD_STATE_DIR/route-state"
+ip() {
+    case "$*" in
+    "-6 route show default") ;;
+    "-o -6 addr show dev eth0 scope global") printf '%s\n' '2: eth0 inet6 2606:4700::2/64 scope global' ;;
+    "route show default") printf '%s\n' 'default via 2606:4700::1 dev eth0' ;;
+    "-6 neigh show dev eth0") printf '%s\n' '2606:4700::1 dev eth0 lladdr 00:11:22:33:44:55 router REACHABLE' ;;
+    "-6 route replace default via 2606:4700::1 dev eth0 metric 4096") printf '%s\n' ok >"$route_state" ;;
+    "-6 route show default dev eth0") [ -f "$route_state" ] && printf '%s\n' 'default via 2606:4700::1 dev eth0 metric 4096' ;;
+    "-6 route del default via 2606:4700::1 dev eth0 metric 4096"|"-6 route del default dev eth0 metric 4096") rm -f "$route_state" ;;
+    *) command ip "$@" ;;
+    esac
+}
+curl() { return 0; }
+export LXD_IPV6_UPLINK=eth0
+ensure_ipv6_default_route || fail "IPv6 default route was not recovered from a verified router neighbor"
+[ -f "$route_state" ] || fail "verified IPv6 route was not retained"
+rm -f "$route_state"
+curl() { return 1; }
+if ensure_ipv6_default_route; then
+    fail "IPv6 route probe failure was accepted"
+fi
+[ ! -e "$route_state" ] || fail "unverified IPv6 route was not rolled back"
+unset LXD_IPV6_UPLINK
+unset -f ip curl
 
 legacy_cleanup="$LXD_STATE_DIR/remove_route.sh"
 printf '%s\n' '#!/bin/bash' 'ip addr del fe80::1/64 dev eth0' >"$legacy_cleanup"
@@ -152,5 +195,14 @@ restore_address 'fd42::1' eth0 64
 restore_address '2606:4700::1' eth0 128
 grep -Fq -- '-6 addr replace 2606:4700::1/128 dev eth0' "$restore_calls" || fail "global /128 mapping was not restored"
 unset -f ip
+
+grep -Fq 'wait_for_container_status "$CONTAINER_NAME" "STOPPED" 24 || return 1' "$ROOT_DIR/scripts/build_ipv6_network.sh" ||
+    fail "routed IPv6 setup must stop only after a confirmed STOPPED state"
+grep -Fq 'setup_ipv6_cron || return 1' "$ROOT_DIR/scripts/build_ipv6_network.sh" ||
+    fail "IPv6 keepalive installation failure must not be hidden"
+grep -Fq 'ip6tables-restore < "$rules_file" 2>/dev/null || return 1' "$ROOT_DIR/scripts/add-ipv6.sh" ||
+    fail "IPv6 iptables restore failure must be reported"
+grep -Fq 'nft -f /etc/nftables.conf 2>/dev/null || return 1' "$ROOT_DIR/scripts/add-ipv6.sh" ||
+    fail "IPv6 nft restore failure must be reported"
 
 printf 'build_ipv6_network tests passed\n'

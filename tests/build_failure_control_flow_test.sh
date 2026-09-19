@@ -11,6 +11,11 @@ fail() {
     exit 1
 }
 
+mock_identity_json() {
+    jq -n --arg owner "${mock_creation_token:-fixture-token}" --arg uuid "fixture-uuid" \
+        '{config: {"user.oneclickvirt.creation-token": $owner, "volatile.uuid": $uuid}}'
+}
+
 run_create_failure_test() {
     local kind="$1"
     local script="$repo_root/scripts/build${kind}.sh"
@@ -184,10 +189,12 @@ run_rollback_cleanup_test() {
         local lxc_log="$workdir/lxc.log"
         lxc() {
             printf '%s\n' "$*" >>"$lxc_log"
+            if [ "${1:-}" = query ]; then mock_identity_json; fi
             return 0
         }
         name="rollback-${kind}"
         created_instance=true
+        created_identity=$'fixture-token\tfixture-uuid'
         build_succeeded=false
         trap cleanup_failed_instance EXIT
         exit 1
@@ -237,7 +244,8 @@ run_init_status_tracking_test() {
         lxc() {
             printf '%s\n' "$*" >>"$lxc_log"
             case "${1:-}" in
-            init) return 42 ;;
+            init) mock_creation_token="${!#}"; mock_creation_token="${mock_creation_token#*=}"; return 42 ;;
+            query) mock_identity_json ;;
             info) return 0 ;;
             delete) return 0 ;;
             esac
@@ -276,8 +284,13 @@ run_configuration_failure_cleanup_test() {
             printf '%s\n' "$*" >>"$lxc_log"
             case "${1:-}" in
             init)
+                mock_creation_token="${!#}"; mock_creation_token="${mock_creation_token#*=}"
                 exists=true
                 return 0
+                ;;
+            query)
+                [ "$exists" = true ] || return 1
+                mock_identity_json
                 ;;
             info)
                 if [ "$exists" = true ]; then
@@ -359,6 +372,42 @@ run_mirror_package_failure_test() {
     )
 }
 
+run_ssh_setup_exec_boundary_test() {
+    local kind="$1"
+    (
+        export ONECLICKVIRT_TESTING=1
+        # shellcheck disable=SC1090
+        source "$repo_root/scripts/build${kind}.sh"
+        name="ssh-${kind}"
+        passwd="test-only-password"
+        cdn_success_url=""
+        local history_executed=false
+        # Isolate downloads and copies, but execute the final history command
+        # through a real process boundary, just like the container exec API.
+        curl() { :; }
+        download_host_file() { :; }
+        cp() { :; }
+        chmod() { :; }
+        dos2unix() { :; }
+        lxc() {
+            [ "${1:-}" = exec ] || return 0
+            shift 3
+            case "${1:-}" in
+                chmod | dos2unix | ./ssh_bash.sh | sudo) return 0 ;;
+                bash)
+                    if [ "${2:-}" = config.sh ]; then return 0; fi
+                    ;;
+            esac
+            command env "$@" || return $?
+            history_executed=true
+        }
+        setup_ssh_bash || fail "build${kind}: SSH setup failed at the exec boundary"
+        [ "$history_executed" = true ] || fail "build${kind}: history cleanup was not executed"
+    )
+}
+
+run_ssh_setup_exec_boundary_test ct
+run_ssh_setup_exec_boundary_test vm
 run_create_failure_test ct
 run_create_failure_test vm
 run_stop_timeout_test ct

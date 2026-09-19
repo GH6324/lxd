@@ -3,12 +3,45 @@
 # https://github.com/oneclickvirt/lxd
 # 2026.08.30
 
+# Load before changing directory or touching shared downloads and logs.
+load_instance_ownership() {
+    local script_dir helper temporary
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 1
+    for helper in "$script_dir/instance_ownership.sh" /usr/local/bin/instance_ownership.sh /root/instance_ownership.sh; do
+        if [ -f "$helper" ]; then
+            # shellcheck source=/dev/null
+            . "$helper" || return 1
+            return 0
+        fi
+    done
+    temporary=$(mktemp "${TMPDIR:-/tmp}/lxd-ownership.XXXXXX") || return 1
+    if ! curl -fsSL "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/instance_ownership.sh" -o "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    # shellcheck source=/dev/null
+    . "$temporary"
+    local status=$?
+    rm -f -- "$temporary"
+    return "$status"
+}
+load_instance_ownership || { echo "Missing instance_ownership.sh; download it with this script." >&2; exit 1; }
+OCV_SCRIPT_RUNTIME=lxd
+OCV_INSTANCE_CLI=lxc
+if [ "${ONECLICKVIRT_TESTING:-}" != "1" ]; then
+    ocv_lock_scripts || exit 1
+fi
+
+
 # cd /root
 red() { printf '\033[31m\033[01m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m\033[01m%s\033[0m\n' "$*"; }
 yellow() { printf '\033[33m\033[01m%s\033[0m\n' "$*"; }
 blue() { printf '\033[36m\033[01m%s\033[0m\n' "$*"; }
 reading() { read -rp "$(green "$1")" "$2"; }
+
+noninteractive="${noninteractive:-${NONINTERACTIVE:-}}"
+export noninteractive
 
 is_true() {
     local value
@@ -307,7 +340,7 @@ check_log() {
         public_port_start="${last_line_array[3]}"
         public_port_end="${last_line_array[4]}"
         if [ -z "$public_port_start" ] || [ -z "$public_port_end" ]; then
-            if is_true "${noninteractive:-}" || is_true "${NONINTERACTIVE:-}"; then
+            if is_true "$noninteractive"; then
                 yellow "Log lacks NAT port range, noninteractive mode will use defaults or environment overrides."
                 yellow "log 缺少 NAT 端口范围，无交互模式将使用默认值或环境变量覆盖值。"
                 public_port_end=30000
@@ -348,6 +381,7 @@ add_batch_active=false
 add_batch_pending_log=""
 add_batch_commit_log=""
 add_batch_created=()
+add_batch_identities=()
 
 lxc_instance_exists() {
     lxc info "$1" >/dev/null 2>&1
@@ -355,23 +389,27 @@ lxc_instance_exists() {
 
 track_add_batch_instance() {
     local candidate="$1"
+    local identity
+    identity=$(ocv_owned_identity "$candidate" "$add_creation_token") || return 1
     local tracked
     for tracked in "${add_batch_created[@]}"; do
         [ "$tracked" = "$candidate" ] && return 0
     done
     add_batch_created+=("$candidate")
+    add_batch_identities+=("$identity")
 }
 
 rollback_add_batch() {
     local index container_name
     for ((index = ${#add_batch_created[@]} - 1; index >= 0; index--)); do
         container_name="${add_batch_created[index]}"
-        lxc delete --force "$container_name" >/dev/null 2>&1 || true
+        ocv_remove_owned_instance "$container_name" "${add_batch_identities[index]}" || echo "Failed to roll back instance: $container_name" >&2
         rm -f -- "$container_name"
     done
     [ -z "$add_batch_pending_log" ] || rm -f -- "$add_batch_pending_log"
     [ -z "$add_batch_commit_log" ] || rm -f -- "$add_batch_commit_log"
     add_batch_created=()
+    add_batch_identities=()
     add_batch_pending_log=""
     add_batch_commit_log=""
     add_batch_active=false
@@ -406,7 +444,7 @@ commit_add_batch_log() {
 }
 
 build_new_containers() {
-    if is_true "${noninteractive:-}" || is_true "${NONINTERACTIVE:-}"; then
+    if is_true "$noninteractive"; then
         noninteractive=true
         container_prefix=$(env_value CONTAINER_PREFIX container_prefix "$container_prefix")
         container_num=$(env_value CONTAINER_NUM container_num "$container_num")
@@ -577,13 +615,12 @@ build_new_containers() {
             red "Container ${container_name} already exists; the existing instance was not changed"
             return 1
         fi
-        if ./buildct.sh "$container_name" "$cpu_nums" "$memory_nums" "$disk_nums" "$ssh_port" "$public_port_start" "$public_port_end" "$input_nums" "$output_nums" "$status_ipv6" "$system"; then
-            track_add_batch_instance "$container_name"
+        add_creation_token=$(ocv_new_creation_token) || return 1
+        if _OCV_CREATE_TOKEN="$add_creation_token" ./buildct.sh "$container_name" "$cpu_nums" "$memory_nums" "$disk_nums" "$ssh_port" "$public_port_start" "$public_port_end" "$input_nums" "$output_nums" "$status_ipv6" "$system"; then
+            track_add_batch_instance "$container_name" || return 1
         else
             build_status=$?
-            if lxc_instance_exists "$container_name"; then
-                track_add_batch_instance "$container_name"
-            fi
+            track_add_batch_instance "$container_name" || true
             red "容器 ${container_name} 创建失败，已停止后续批量创建"
             red "Container ${container_name} creation failed; remaining batch items were not started"
             rm -f -- "$container_name"
@@ -608,6 +645,7 @@ build_new_containers() {
     rm -f -- "$add_batch_pending_log"
     add_batch_pending_log=""
     add_batch_created=()
+    add_batch_identities=()
     add_batch_active=false
 }
 

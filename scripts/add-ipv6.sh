@@ -81,7 +81,7 @@ restore_address() {
     local address="$1" interface="$2" prefix_len="$3"
     is_restorable_global_ipv6 "$address" || return 0
     if ! ip -6 addr show dev "$interface" 2>/dev/null | grep -Fqw "$address"; then
-        ip -6 addr replace "$address/$prefix_len" dev "$interface" 2>/dev/null || true
+        ip -6 addr replace "$address/$prefix_len" dev "$interface" 2>/dev/null || return 1
     fi
 }
 
@@ -116,18 +116,18 @@ restore_ipt() {
     done < "$rules_file"
     if [ ${#array[@]} -gt 0 ]; then
         for parameter in "${array[@]}"; do
-            restore_address "$parameter" "$interface" "$prefix_len"
+            restore_address "$parameter" "$interface" "$prefix_len" || return 1
         done
     fi
     # 恢复ip6tables规则
     if command -v ip6tables-restore >/dev/null 2>&1; then
-        ip6tables-restore < "$rules_file" 2>/dev/null
+        ip6tables-restore < "$rules_file" 2>/dev/null || return 1
         echo "iptables IPv6 rules restored"
     fi
     # 持久化
     if command -v netfilter-persistent >/dev/null 2>&1; then
-        netfilter-persistent save >/dev/null 2>&1
-        netfilter-persistent reload >/dev/null 2>&1
+        netfilter-persistent save >/dev/null 2>&1 || return 1
+        netfilter-persistent reload >/dev/null 2>&1 || return 1
     fi
     return 0
 }
@@ -160,10 +160,10 @@ restore_nft() {
     [ "$(cat "$STATE_DIR/lxd_ipv6_mode" 2>/dev/null || true)" = "nat66" ] && return 0
     if [ ${#addrs[@]} -gt 0 ]; then
         for addr in "${addrs[@]}"; do
-            restore_address "$addr" "$interface" "$prefix_len"
+            restore_address "$addr" "$interface" "$prefix_len" || return 1
         done
     fi
-    nft -f /etc/nftables.conf 2>/dev/null
+    nft -f /etc/nftables.conf 2>/dev/null || return 1
     echo "nftables rules restored"
     return 0
 }

@@ -3,30 +3,56 @@
 # https://github.com/oneclickvirt/lxd
 # 2026.08.30
 
+# Load before changing directory or touching shared downloads and logs.
+load_instance_ownership() {
+    local script_dir helper temporary
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 1
+    for helper in "$script_dir/instance_ownership.sh" /usr/local/bin/instance_ownership.sh /root/instance_ownership.sh; do
+        if [ -f "$helper" ]; then
+            # shellcheck source=/dev/null
+            . "$helper" || return 1
+            return 0
+        fi
+    done
+    temporary=$(mktemp "${TMPDIR:-/tmp}/lxd-ownership.XXXXXX") || return 1
+    if ! curl -fsSL "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/instance_ownership.sh" -o "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    # shellcheck source=/dev/null
+    . "$temporary"
+    local status=$?
+    rm -f -- "$temporary"
+    return "$status"
+}
+load_instance_ownership || { echo "Missing instance_ownership.sh; download it with this script." >&2; exit 1; }
+OCV_SCRIPT_RUNTIME=lxd
+OCV_INSTANCE_CLI=lxc
+if [ "${ONECLICKVIRT_TESTING:-}" != "1" ]; then
+    ocv_lock_scripts || exit 1
+fi
+
+
 # Remove only a VM that this invocation created when a later step fails.  This
 # prevents a failed creation from being reported as a running VM while keeping
 # an existing VM with the requested name untouched.
 created_instance=false
+created_identity=""
 build_succeeded=false
 cleanup_failed_instance() {
     local status=$?
     if [ "$created_instance" = true ] && [ "$build_succeeded" != true ] && [ -n "${name:-}" ] && command -v lxc >/dev/null 2>&1; then
-        lxc delete --force "$name" >/dev/null 2>&1 || true
+        ocv_remove_owned_instance "$name" "$created_identity" || echo "Failed to roll back LXD instance: $name" >&2
     fi
     return "$status"
 }
 
 create_instance_with_tracking() {
-    local init_status
-    "$@"
-    init_status=$?
-    if [ "$init_status" -eq 0 ]; then
-        created_instance=true
-        return 0
-    fi
-    if lxc info "$name" >/dev/null 2>&1; then
-        created_instance=true
-    fi
+    local init_status=0
+    ocv_create_owned "$name" "$@" || init_status=$?
+    created_identity="$ocv_created_identity"
+    created_instance=false
+    [ -z "$created_identity" ] || created_instance=true
     return "$init_status"
 }
 if [[ "${ONECLICKVIRT_TESTING:-}" != "1" ]]; then
@@ -259,9 +285,10 @@ retry_curl() {
     local delay=1
     _retry_result=""
     for ((attempt = 1; attempt <= max_attempts; attempt++)); do
-        _retry_result=$(curl -slk -m 6 "$url")
-        if [ $? -eq 0 ] && [ -n "$_retry_result" ]; then
-            return 0
+        if _retry_result=$(curl -slk -m 6 "$url"); then
+            if [ -n "$_retry_result" ]; then
+                return 0
+            fi
         fi
         sleep "$delay"
         delay=$((delay * 2))
@@ -384,8 +411,7 @@ remove_device_if_exists() {
 }
 
 ensure_container_ipv6_cron() {
-    # shellcheck disable=SC2016
-    lxc exec "$name" -- sh -c 'cron_line="*/1 * * * * curl -m 6 -s ipv6.ip.sb && curl -m 6 -s ipv6.ip.sb"; if ! crontab -l 2>/dev/null | grep -Fqx "$cron_line"; then (crontab -l 2>/dev/null; printf "%s\n" "$cron_line") | crontab -; fi'
+    lxc exec "$name" -- sh -c 'set -eu; if [ -L /etc/cron.d ]; then exit 1; fi; [ -d /etc/cron.d ] || exit 0; mkdir -p /run/lock; test ! -L /run/lock; lock=/run/lock/oneclickvirt-ipv6.lock.d; acquired=0; i=0; while [ "$i" -lt 100 ]; do if mkdir "$lock" 2>/dev/null; then acquired=1; break; fi; i=$((i + 1)); sleep 0.1; done; [ "$acquired" -eq 1 ]; trap '\''rmdir "$lock" 2>/dev/null || true'\'' EXIT; target=/etc/cron.d/oneclickvirt-ipv6; line="*/1 * * * * root curl --noproxy '\''*'\'' -6 -fsS --connect-timeout 6 --max-time 6 https://ipv6.ip.sb >/dev/null 2>&1 && curl --noproxy '\''*'\'' -6 -fsS --connect-timeout 6 --max-time 6 https://ipv6.ip.sb >/dev/null 2>&1"; if [ -L "$target" ] || { [ -e "$target" ] && [ ! -f "$target" ]; }; then exit 1; fi; if [ -f "$target" ] && grep -Fqx "$line" "$target"; then exit 0; fi; tmp=$(mktemp /etc/cron.d/.oneclickvirt-ipv6.XXXXXX); trap '\''rm -f -- "$tmp"; rmdir "$lock" 2>/dev/null || true'\'' EXIT; if [ -f "$target" ]; then cat "$target" >"$tmp"; last=$(tail -c 1 "$target" 2>/dev/null | od -An -t x1 | tr -d "[:space:]"); [ -z "$last" ] || [ "$last" = 0a ] || printf "\n" >>"$tmp"; fi; printf "%s\n" "$line" >>"$tmp"; chmod 0644 "$tmp"; mv -f "$tmp" "$target"'
 }
 
 download_host_file() {
@@ -739,7 +765,8 @@ setup_ssh_bash() {
     lxc exec "$name" -- chmod +x config.sh || return 1
     lxc exec "$name" -- dos2unix config.sh || return 1
     lxc exec "$name" -- bash config.sh || return 1
-    lxc exec "$name" -- history -c || return 1
+    # history is a Bash builtin, not an executable in the container.
+    lxc exec "$name" -- bash -c 'history -c' || return 1
 }
 
 wait_for_vm_ready_to_shutdown() {

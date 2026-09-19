@@ -6,7 +6,7 @@ installer="$repo_root/scripts/lxdinstall.sh"
 load_function() {
     source <(awk -v name="$1" '$0 == name "() {" { printing=1 } printing { print } printing && /^}$/ { exit }' "$installer" | sed 's#/snap/bin/lxc#lxc#g')
 }
-for name in api_metadata valid_storage_pool_name active_storage_pool storage_pool_exists ensure_runtime_network; do load_function "$name"; done
+for name in runtime_resource_names api_metadata valid_storage_pool_name active_storage_pool storage_pool_exists ensure_runtime_network; do load_function "$name"; done
 _green() { :; }
 _yellow() { :; }
 _red() { printf '%s\n' "$*" >&2; }
@@ -34,7 +34,7 @@ lxc() {
     case "$*" in
         info) ! $mock_daemon_fails ;;
         'query /1.0/profiles/default') emit_api "$mock_profile" ;;
-        'storage list --format csv -c n') printf '%s\n' "$mock_pool_list" ;;
+        'storage list --format json') printf '%s\n' "$mock_pool_list" | jq -Rsc '[split("\n")[] | select(length > 0) | {name: .}]' ;;
         'storage show '*) grep -Fxq "$3" <<< "$mock_pool_list" ;;
         'profile list --format csv -c n') printf '%s\n' "$mock_profiles" ;;
         'profile create default') mock_profiles=default; mock_changes=$((mock_changes + 1)) ;;
@@ -44,7 +44,7 @@ lxc() {
         'profile device add default eth0 nic network=lxdbr0 name=eth0')
             mock_profile=$(jq '.devices.eth0 = {"type":"nic","network":"lxdbr0","name":"eth0"}' <<< "$mock_profile")
             mock_changes=$((mock_changes + 1)) ;;
-        'network list --format csv -c n') if $mock_bridge_exists; then printf '%s\n' lxdbr0; fi ;;
+        'network list --format json') if $mock_bridge_exists; then printf '[{"name":"lxdbr0"}]\n'; else printf '[]\n'; fi ;;
         'network create lxdbr0 ipv4.address=auto ipv4.nat=true ipv4.dhcp=true ipv6.address=none')
             $mock_network_create_fails && return 1
             mock_bridge_exists=true; mock_changes=$((mock_changes + 1)) ;;
@@ -116,6 +116,37 @@ ip() {
     mock_bridge_exists=true
     ensure_runtime_network || fail 'direct metadata responses must remain supported'
 )
+# Failed CLI commands and malformed payloads must not become empty defaults,
+# even when the production shell does not enable pipefail (Debian jq 1.6).
+for resource in profile network; do
+    for failure in empty whitespace multiple malformed null wrong_schema wrong_field command_failure; do
+        (
+            set +o pipefail
+            mock_api_envelope=false mock_bridge_exists=true
+            mock_profile='{"devices":{"root":{"type":"disk","path":"/","pool":"local"},"eth0":{"type":"nic","network":"lxdbr0"}}}'
+            if [[ "$resource" == profile ]]; then payload=$mock_profile; else payload=$mock_network_config; fi
+            case "$failure" in
+                empty) payload='' ;;
+                whitespace) payload=$' \n\t' ;;
+                multiple) payload="$payload $payload" ;;
+                malformed) payload='{' ;;
+                null) payload=null ;;
+                wrong_schema)
+                    if [[ "$resource" == profile ]]; then payload='{"devices":[]}';
+                    else payload=$(jq '.config=[]' <<<"$payload"); fi ;;
+                wrong_field)
+                    if [[ "$resource" == profile ]]; then payload='{"devices":{"root":null}}';
+                    else payload=$(jq '.config["ipv4.dhcp"]=false' <<<"$payload"); fi ;;
+                command_failure) emit_api() { printf '%s\n' "$1"; return 42; } ;;
+            esac
+            if [[ "$resource" == profile ]]; then mock_profile=$payload; else mock_network_config=$payload; fi
+            if ensure_runtime_network; then fail "$failure $resource must be rejected"; fi
+            [[ "$mock_changes" == 0 ]] || fail "$failure $resource caused initialization writes"
+        )
+    done
+done
+printf 'Installer API boundaries passed (16 additional scenarios, no skipped tests)\n'
+
 panel_init="$repo_root/panel_scripts/panel_init.sh"
 grep -Fq 'ensure_runtime_storage || exit 1' "$panel_init" || fail 'panel init must repair an empty storage configuration before profile/network setup'
 grep -Fq 'lxd init --auto' "$panel_init" || fail 'panel init must initialize an uninitialized LXD daemon'

@@ -6,6 +6,9 @@ Green="\033[32m"
 Font="\033[0m"
 Red="\033[31m"
 
+noninteractive="${noninteractive:-${NONINTERACTIVE:-}}"
+export noninteractive
+
 is_true() {
     local value
     value=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
@@ -33,7 +36,7 @@ ovz_no() {
 }
 
 add_swap() {
-    if is_true "${noninteractive:-}" || is_true "${NONINTERACTIVE:-}"; then
+    if is_true "$noninteractive"; then
         swapsize="${SWAP_SIZE:-${swapsize:-}}"
     else
         echo -e "${Green}请输入需要添加的swap，建议为内存的2倍！${Font}"
@@ -85,7 +88,7 @@ del_swap() {
 main() {
     root_need
     ovz_no
-    if is_true "${noninteractive:-}" || is_true "${NONINTERACTIVE:-}"; then
+    if is_true "$noninteractive"; then
         case "${SWAP_ACTION:-add}" in
         add)
             add_swap

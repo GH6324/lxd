@@ -86,8 +86,13 @@ if ! grep -Fq 'net.ipv6.conf.${ipv6_network_name}.accept_ra=2' "$repo_root/scrip
     fail "IPv6 forwarding must preserve router advertisements on the LXD uplink"
 fi
 # shellcheck disable=SC2016 # The literal is the source-code contract under test.
-if grep -Fq 'net.ipv6.conf.all.proxy_ndp=1' "$repo_root/scripts/build_ipv6_network.sh"; then
-    fail "LXD must not enable NDP proxying globally"
+if ! grep -Fq 'net.ipv6.conf.all.proxy_ndp=1' "$repo_root/scripts/build_ipv6_network.sh"; then
+    fail "LXD routed NICs require global NDP proxying"
+fi
+if ! grep -Fq -- '-6 -fsS --connect-timeout 6 --max-time 6 https://ipv6.ip.sb' "$repo_root/scripts/build_ipv6_network.sh" ||
+   ! grep -Fq -- '-6 -fsS --connect-timeout 6 --max-time 6 https://ipv6.ip.sb' "$repo_root/scripts/buildct.sh" ||
+   ! grep -Fq -- '-6 -fsS --connect-timeout 6 --max-time 6 https://ipv6.ip.sb' "$repo_root/scripts/buildvm.sh"; then
+    fail "IPv6 keepalive jobs must force IPv6 and fail closed on probe errors"
 fi
 
 printf 'LXD IPv6 local-address tests passed\n'

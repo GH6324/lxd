@@ -3,6 +3,36 @@
 # https://github.com/oneclickvirt/lxd
 # 2026.08.30
 
+# Load before changing directory or touching shared downloads and logs.
+load_instance_ownership() {
+    local script_dir helper temporary
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 1
+    for helper in "$script_dir/instance_ownership.sh" /usr/local/bin/instance_ownership.sh /root/instance_ownership.sh; do
+        if [ -f "$helper" ]; then
+            # shellcheck source=/dev/null
+            . "$helper" || return 1
+            return 0
+        fi
+    done
+    temporary=$(mktemp "${TMPDIR:-/tmp}/lxd-ownership.XXXXXX") || return 1
+    if ! curl -fsSL "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/instance_ownership.sh" -o "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    # shellcheck source=/dev/null
+    . "$temporary"
+    local status=$?
+    rm -f -- "$temporary"
+    return "$status"
+}
+load_instance_ownership || { echo "Missing instance_ownership.sh; download it with this script." >&2; exit 1; }
+OCV_SCRIPT_RUNTIME=lxd
+OCV_INSTANCE_CLI=lxc
+if [ "${ONECLICKVIRT_TESTING:-}" != "1" ]; then
+    ocv_lock_scripts || exit 1
+fi
+
+
 # 输入
 # ./buildct.sh 服务器名称 CPU核数 内存大小 硬盘大小 SSH端口 外网起端口 外网止端口 下载速度 上传速度 是否启用IPV6(Y or N) 系统(留空则为debian12)
 # 如果 外网起端口 外网止端口 都设置为0则不做区间外网端口映射了，只映射基础的SSH端口，注意不能为空，不进行映射需要设置为0
@@ -11,26 +41,22 @@
 # failed configuration must not leave an instance that later callers mistake
 # for a successful result, nor may it remove a caller's pre-existing instance.
 created_instance=false
+created_identity=""
 build_succeeded=false
 cleanup_failed_instance() {
     local status=$?
     if [ "$created_instance" = true ] && [ "$build_succeeded" != true ] && [ -n "${name:-}" ] && command -v lxc >/dev/null 2>&1; then
-        lxc delete --force "$name" >/dev/null 2>&1 || true
+        ocv_remove_owned_instance "$name" "$created_identity" || echo "Failed to roll back LXD instance: $name" >&2
     fi
     return "$status"
 }
 
 create_instance_with_tracking() {
-    local init_status
-    "$@"
-    init_status=$?
-    if [ "$init_status" -eq 0 ]; then
-        created_instance=true
-        return 0
-    fi
-    if lxc info "$name" >/dev/null 2>&1; then
-        created_instance=true
-    fi
+    local init_status=0
+    ocv_create_owned "$name" "$@" || init_status=$?
+    created_identity="$ocv_created_identity"
+    created_instance=false
+    [ -z "$created_identity" ] || created_instance=true
     return "$init_status"
 }
 if [[ "${ONECLICKVIRT_TESTING:-}" != "1" ]]; then
@@ -231,8 +257,7 @@ remove_device_if_exists() {
 }
 
 ensure_container_ipv6_cron() {
-    # shellcheck disable=SC2016
-    lxc exec "$name" -- sh -c 'cron_line="*/1 * * * * curl -m 6 -s ipv6.ip.sb && curl -m 6 -s ipv6.ip.sb"; if ! crontab -l 2>/dev/null | grep -Fqx "$cron_line"; then (crontab -l 2>/dev/null; printf "%s\n" "$cron_line") | crontab -; fi'
+    lxc exec "$name" -- sh -c 'set -eu; if [ -L /etc/cron.d ]; then exit 1; fi; [ -d /etc/cron.d ] || exit 0; mkdir -p /run/lock; test ! -L /run/lock; lock=/run/lock/oneclickvirt-ipv6.lock.d; acquired=0; i=0; while [ "$i" -lt 100 ]; do if mkdir "$lock" 2>/dev/null; then acquired=1; break; fi; i=$((i + 1)); sleep 0.1; done; [ "$acquired" -eq 1 ]; trap '\''rmdir "$lock" 2>/dev/null || true'\'' EXIT; target=/etc/cron.d/oneclickvirt-ipv6; line="*/1 * * * * root curl --noproxy '\''*'\'' -6 -fsS --connect-timeout 6 --max-time 6 https://ipv6.ip.sb >/dev/null 2>&1 && curl --noproxy '\''*'\'' -6 -fsS --connect-timeout 6 --max-time 6 https://ipv6.ip.sb >/dev/null 2>&1"; if [ -L "$target" ] || { [ -e "$target" ] && [ ! -f "$target" ]; }; then exit 1; fi; if [ -f "$target" ] && grep -Fqx "$line" "$target"; then exit 0; fi; tmp=$(mktemp /etc/cron.d/.oneclickvirt-ipv6.XXXXXX); trap '\''rm -f -- "$tmp"; rmdir "$lock" 2>/dev/null || true'\'' EXIT; if [ -f "$target" ]; then cat "$target" >"$tmp"; last=$(tail -c 1 "$target" 2>/dev/null | od -An -t x1 | tr -d "[:space:]"); [ -z "$last" ] || [ "$last" = 0a ] || printf "\n" >>"$tmp"; fi; printf "%s\n" "$line" >>"$tmp"; chmod 0644 "$tmp"; mv -f "$tmp" "$target"'
 }
 
 download_host_file() {
@@ -348,6 +373,7 @@ find_remote_image_alias() {
 # 处理镜像
 process_image() {
     image_download_url=""
+    image_name=""
     fixed_system=false
     status_tuna=false
     if [ -n "${self_image_arch:-}" ]; then
@@ -374,7 +400,9 @@ process_self_fixed_images() {
 
 # 使用固定镜像
 use_fixed_image() {
-    local image_name=$1
+    # This is the selected image consumed by create_container after returning,
+    # not a temporary download-only name (Bash locals do not survive the call).
+    image_name="$1"
     fixed_system=true
     image_download_url="https://github.com/oneclickvirt/lxd_images/releases/download/${a}/${image_name}"
     image_alias_output=$(lxc image alias list)
@@ -612,7 +640,8 @@ setup_ssh_bash() {
     lxc exec "$name" -- chmod +x config.sh || return 1
     lxc exec "$name" -- dos2unix config.sh || return 1
     lxc exec "$name" -- bash config.sh || return 1
-    lxc exec "$name" -- history -c || return 1
+    # history is a Bash builtin, not an executable in the container.
+    lxc exec "$name" -- bash -c 'history -c' || return 1
 }
 
 configure_port() {

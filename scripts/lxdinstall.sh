@@ -56,8 +56,41 @@ storage_pool_exists() {
 # `lxc query` returns an API envelope on real daemons while test doubles and
 # older wrappers may return the metadata object directly.  Normalize both
 # forms before inspecting profile/network fields.
+# JSON inventories work on LTS clients whose storage/network list has no -c.
+# Capture the command first so a daemon failure cannot become an empty list.
+runtime_resource_names() {
+    local data
+    data=$(lxc "$1" list --format json) || return 1
+    jq -sr '
+        if length != 1 or (.[0] | type) != "array" then error("invalid runtime inventory")
+        else .[0] end |
+        if all(.[]; type == "object" and (.name | type) == "string" and (.name | length) > 0)
+        then .[].name else error("invalid resource name") end
+    ' <<<"$data"
+}
+
 api_metadata() {
-    jq -c 'if type == "object" and ((.metadata? | type) == "object") then .metadata else . end'
+    # Slurp first: jq 1.6 can exit successfully on empty input even with -e.
+    # Exactly one object is required before any default-setting mutation.
+    jq -cs --arg resource "${1:-object}" '
+        if length != 1 or (.[0] | type) != "object"
+        then error("expected one API object") else .[0] end |
+        if has("metadata") then
+            if .type == "sync" and (.metadata | type) == "object"
+               and ((has("status_code") | not) or .status_code == 200)
+            then .metadata else error("invalid API envelope") end
+        elif .type == "error" or .type == "async" or .type == "sync"
+        then error("invalid API response") else . end |
+        if $resource == "profile" then
+            if (.devices | type) == "object"
+               and all(.devices[]; type == "object" and all(.[]; type == "string"))
+            then . else error("invalid profile devices") end
+        elif $resource == "network" then
+            if .type == "bridge" and .managed == true
+               and (.config | type) == "object" and all(.config[]; type == "string")
+            then . else error("invalid managed bridge configuration") end
+        else . end
+    '
 }
 
 valid_storage_pool_name() {
@@ -86,7 +119,7 @@ active_storage_pool() {
         return 0
     fi
     local pools
-    pools=$(/snap/bin/lxc storage list --format csv -c n) || return 2
+    pools=$(runtime_resource_names storage) || return 2
     if [ -n "$pools" ]; then
         if [[ "$pools" != *$'\n'* ]] && valid_storage_pool_name "$pools" && storage_pool_exists "$pools"; then
             printf '%s\n' "$pools"
@@ -114,6 +147,12 @@ is_true() {
     local value
     value=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
     [ "$value" = "true" ] || [ "$value" = "1" ] || [ "$value" = "yes" ] || [ "$value" = "y" ]
+}
+
+is_noninteractive() {
+    noninteractive="${noninteractive:-${NONINTERACTIVE:-}}"
+    export noninteractive
+    is_true "$noninteractive"
 }
 
 sed_compatible() {
@@ -285,7 +324,7 @@ restart_lxd_daemon_safely() {
     # Ubuntu 24.04 with the LXD 5.21 snap can leave daemon.stop waiting
     # forever after a reboot (the daemon repeatedly reports fanotify event 0).
     # Queue the restart without blocking the installer, then bound the wait.
-    systemctl restart --no-block snap.lxd.daemon 2>/dev/null || true
+    systemctl restart --no-block snap.lxd.daemon 2>/dev/null || return 1
     if wait_for_lxd_daemon_ready 120; then
         return 0
     fi
@@ -294,7 +333,7 @@ restart_lxd_daemon_safely() {
     _yellow "LXD 守护进程重启超时，正在强制恢复卡住的停止任务"
     systemctl kill --kill-who=all --signal=SIGKILL snap.lxd.daemon 2>/dev/null || true
     systemctl reset-failed snap.lxd.daemon 2>/dev/null || true
-    systemctl start --no-block snap.lxd.daemon 2>/dev/null || true
+    systemctl start --no-block snap.lxd.daemon 2>/dev/null || return 1
     if wait_for_lxd_daemon_ready 120; then
         return 0
     fi
@@ -356,6 +395,23 @@ install_package() {
         _green "$package_name has attempted to install"
         _green "$package_name 已尝试安装"
     fi
+}
+
+# A minimal Debian/Ubuntu host may have the LXD snap and no host dnsmasq
+# executable.  LXD still delegates managed bridge DNS checks to dnsmasq, so
+# make this dependency explicit instead of allowing initialization to fail
+# after the runtime package has already been installed.
+install_dnsmasq() {
+    command -v dnsmasq >/dev/null 2>&1 && return 0
+    local package_name=dnsmasq
+    if command -v apt-get >/dev/null 2>&1; then
+        package_name=dnsmasq-base
+    fi
+    install_package "$package_name" || return 1
+    command -v dnsmasq >/dev/null 2>&1 || {
+        _red "dnsmasq was installed but the executable is unavailable"
+        return 1
+    }
 }
 
 # Other vendor sysctl files can contain unsupported optional keys. Validate
@@ -517,6 +573,7 @@ install_base_packages() {
         install_package ipcalc || return 1
     fi
     install_package unzip || return 1
+    install_dnsmasq || return 1
 }
 
 install_lxd() {
@@ -605,10 +662,10 @@ install_lxd() {
 
 configure_resources() {
     # 支持环境变量预定义以实现无交互安装。
-    if is_true "${noninteractive:-}" || is_true "${NONINTERACTIVE:-}" || [ -n "${DISK_NUMS:-}" ] || [ -n "${STORAGE_PATH:-}" ]; then
-        noninteractive=true
+    if [ -z "${noninteractive:-${NONINTERACTIVE:-}}" ] && { [ -n "${DISK_NUMS:-}" ] || [ -n "${STORAGE_PATH:-}" ]; }; then
+        export noninteractive=true
     fi
-    if is_true "${noninteractive:-}"; then
+    if is_noninteractive; then
         # 存储路径：优先使用 STORAGE_PATH 环境变量，未设置则留空使用默认
         storage_path="${STORAGE_PATH:-}"
         if [ -n "$storage_path" ]; then
@@ -654,7 +711,7 @@ configure_resources() {
     else
         while true; do
             _green "Do you want to specify a custom path for the storage pool? (y/n) [n]:"
-            reading "是否需要指定存储池的自定义路径？(y/n) [n]：" use_custom_path
+            reading "是否需要指定存储池的自定义路径？(y/n) [n]：" use_custom_path || return 1
             use_custom_path=${use_custom_path:-n}
             if [[ "$use_custom_path" =~ ^[yYnN]$ ]]; then
                 break
@@ -666,7 +723,7 @@ configure_resources() {
         if [[ "$use_custom_path" =~ ^[yY]$ ]]; then
             while true; do
                 _green "Please enter the custom storage path (e.g., /data/lxd-storage):"
-                reading "请输入自定义存储路径 (例如：/data/lxd-storage)：" storage_path
+                reading "请输入自定义存储路径 (例如：/data/lxd-storage)：" storage_path || return 1
                 if [[ -n "$storage_path" && "$storage_path" =~ ^/.+ ]]; then
                     if [ ! -d "$storage_path" ]; then
                         mkdir -p "$storage_path" 2>/dev/null
@@ -694,7 +751,7 @@ configure_resources() {
         fi
         while true; do
             _green "How large a storage pool does the host need to open? (Note that it is in GB, enter 10 if you need 10G storage pool):"
-            reading "宿主机需要开设多大的存储池？(注意是GB为单位，需要10G存储池则输入10)：" disk_nums
+            reading "宿主机需要开设多大的存储池？(注意是GB为单位，需要10G存储池则输入10)：" disk_nums || return 1
             if [[ "$disk_nums" =~ ^[1-9][0-9]*$ ]]; then
                 break
             else
@@ -969,6 +1026,28 @@ execute_storage_init() {
     return $status
 }
 
+# Newly installed userspace tools do not imply a kernel reboot is required.
+# Preserve fallback/retry only when support is neither active nor loadable.
+ensure_storage_kernel_support() {
+    local backend="$1" module
+    case "$backend" in
+        btrfs|zfs)
+            grep -qw "$backend" /proc/filesystems && return 0
+            module="$backend"
+            ;;
+        lvm)
+            grep -qw device-mapper /proc/devices && return 0
+            module=dm_mod
+            ;;
+        *) return 0 ;;
+    esac
+    modprobe "$module" && return 0
+    _yellow "$backend kernel support is unavailable; retaining the retry marker and trying another backend"
+    _yellow "$backend 内核支持不可用，保留重试标记并尝试其他存储后端"
+    echo "$backend" >/usr/local/bin/lxd_reboot || return 1
+    return 1
+}
+
 init_storage_backend() {
     local backend="$1"
     if is_storage_tried "$backend"; then
@@ -989,56 +1068,28 @@ init_storage_backend() {
     fi
     _green "尝试使用 $backend 类型，存储池大小为 $disk_nums"
     _green "Trying to use $backend type with storage pool size $disk_nums"
-    local need_reboot=false
     if [ "$backend" = "btrfs" ] && ! is_storage_installed "btrfs" && ! command -v btrfs >/dev/null; then
         _yellow "正在安装 btrfs-progs..."
         _yellow "Installing btrfs-progs..."
         install_package btrfs-progs || return 1
         record_installed_storage "btrfs"
-        modprobe btrfs || true
-        _green "无法加载btrfs模块。请重启本机再次执行本脚本以加载btrfs内核。"
-        _green "btrfs module could not be loaded. Please reboot the machine and execute this script again."
-        echo "$backend" >/usr/local/bin/lxd_reboot
-        need_reboot=true
     elif [ "$backend" = "lvm" ] && ! is_storage_installed "lvm" && ! command -v lvm >/dev/null; then
         _yellow "正在安装 lvm2..."
         _yellow "Installing lvm2..."
         install_package lvm2 || return 1
         record_installed_storage "lvm"
-        modprobe dm-mod || true
-        _green "无法加载LVM模块。请重启本机再次执行本脚本以加载LVM内核。"
-        _green "LVM module could not be loaded. Please reboot the machine and execute this script again."
-        echo "$backend" >/usr/local/bin/lxd_reboot
-        need_reboot=true
     elif [ "$backend" = "zfs" ] && ! is_storage_installed "zfs" && ! command -v zfs >/dev/null; then
         _yellow "正在安装 zfsutils-linux..."
         _yellow "Installing zfsutils-linux..."
         install_package zfsutils-linux || return 1
         record_installed_storage "zfs"
-        modprobe zfs || true
-        _green "无法加载ZFS模块。请重启本机再次执行本脚本以加载ZFS内核。"
-        _green "ZFS module could not be loaded. Please reboot the machine and execute this script again."
-        echo "$backend" >/usr/local/bin/lxd_reboot
-        need_reboot=true
     elif [ "$backend" = "ceph" ] && ! is_storage_installed "ceph" && ! command -v ceph >/dev/null; then
         _yellow "正在安装 ceph-common..."
         _yellow "Installing ceph-common..."
         install_package ceph-common || return 1
         record_installed_storage "ceph"
     fi
-    if [ "$backend" = "btrfs" ] && is_storage_installed "btrfs" && ! grep -q btrfs /proc/filesystems; then
-        modprobe btrfs || true
-    elif [ "$backend" = "lvm" ] && is_storage_installed "lvm" && ! grep -q dm-mod /proc/modules; then
-        modprobe dm-mod || true
-    elif [ "$backend" = "zfs" ] && is_storage_installed "zfs" && ! grep -q zfs /proc/filesystems; then
-        modprobe zfs || true
-    fi
-    if [ "$need_reboot" = true ]; then
-        # Keep the reboot marker for a later retry, while allowing the caller
-        # to fall back to another backend in this run. A missing optional
-        # kernel module must not leave an otherwise usable LXD host half set up.
-        return 1
-    fi
+    ensure_storage_kernel_support "$backend" || return 1
     local temp
     temp=$(execute_storage_init "$backend")
     local status=$?
@@ -1114,7 +1165,8 @@ ensure_runtime_network() {
     if ! grep -Fxq default <<< "$profiles"; then
         lxc profile create default || return 1
     fi
-    profile=$(lxc query /1.0/profiles/default | api_metadata) || return 1
+    profile=$(lxc query /1.0/profiles/default) || return 1
+    profile=$(api_metadata profile <<<"$profile") || return 1
     roots=$(jq -er '[.devices // {} | to_entries[] | select(.value.type == "disk" and .value.path == "/")] | length' <<< "$profile") || return 1
     if [ "$roots" -eq 0 ]; then
         if jq -e '.devices.root != null' <<< "$profile" >/dev/null; then
@@ -1160,7 +1212,7 @@ ensure_runtime_network() {
         return 1
     fi
 
-    networks=$(lxc network list --format csv -c n) || return 1
+    networks=$(runtime_resource_names network) || return 1
     if ! grep -Fxq "$bridge" <<< "$networks"; then
         if ip link show dev "$bridge" >/dev/null 2>&1; then
             _red "$bridge already exists outside LXD; refusing to replace it"
@@ -1170,7 +1222,8 @@ ensure_runtime_network() {
         lxc network create "$bridge" ipv4.address=auto ipv4.nat=true ipv4.dhcp=true ipv6.address=none || return 1
         lxc network set "$bridge" ipv6.address auto || _yellow "IPv6 unavailable; retaining IPv4 networking"
     fi
-    config=$(lxc query "/1.0/networks/$bridge" | api_metadata) || return 1
+    config=$(lxc query "/1.0/networks/$bridge") || return 1
+    config=$(api_metadata network <<<"$config") || return 1
     jq -e '.type == "bridge" and .managed == true' <<< "$config" >/dev/null || {
         _red "$bridge is not a managed bridge"; return 1;
     }
@@ -1208,6 +1261,20 @@ ensure_runtime_network() {
 configure_lxd_network() {
     ensure_lxc_path
     ensure_runtime_network || return 1
+    local config dns_mode raw_dnsmasq
+    config=$(lxc query /1.0/networks/lxdbr0) || return 1
+    config=$(api_metadata network <<<"$config") || return 1
+    dns_mode=$(jq -r '.config["dns.mode"] // empty' <<< "$config") || return 1
+    if [ -z "$dns_mode" ]; then
+        lxc network set lxdbr0 dns.mode managed || return 1
+    fi
+    # A managed bridge with no explicit raw.dnsmasq can inherit the host's
+    # loopback resolver, which is unreachable from containers. Add upstreams
+    # only when no administrator DNS configuration exists.
+    raw_dnsmasq=$(jq -r '.config["raw.dnsmasq"] // empty' <<< "$config") || return 1
+    if [ -z "$raw_dnsmasq" ]; then
+        lxc network set lxdbr0 raw.dnsmasq $'server=1.1.1.1\nserver=8.8.8.8' || return 1
+    fi
     lxc config set images.auto_update_interval 0 || return 1
     if ! lxc remote list 2>/dev/null | grep -q '^| opsmaru[[:space:]]*|'; then
         lxc remote add opsmaru https://images.opsmaru.dev/spaces/9bfad87bd318b8f06012059a --public --protocol simplestreams ||
@@ -1221,6 +1288,7 @@ download_preset_files() {
         "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_bash.sh"
         "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_sh.sh"
         "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/config.sh"
+        "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/instance_ownership.sh"
         "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/buildct.sh"
     )
     for file in "${files[@]}"; do
@@ -1233,6 +1301,7 @@ download_preset_files() {
     cp /root/ssh_sh.sh /usr/local/bin || return 1
     cp /root/ssh_bash.sh /usr/local/bin || return 1
     cp /root/config.sh /usr/local/bin || return 1
+    cp /root/instance_ownership.sh /usr/local/bin || return 1
 }
 
 configure_system() {
@@ -1300,13 +1369,329 @@ install_dns_check() {
     fi
 }
 
+# LXD proxy devices that listen on the host address traverse the Linux bridge
+# netfilter path. Load and persist br_netfilter so published ports can reach
+# containers after both the current run and a host reboot.
+ensure_bridge_netfilter() {
+    local module_file=/etc/modules-load.d/oneclickvirt-bridge-netfilter.conf
+    if [ ! -d /proc/sys/net/bridge ]; then
+        command -v modprobe >/dev/null 2>&1 || return 1
+        modprobe br_netfilter || return 1
+    fi
+    [ -d /proc/sys/net/bridge ] || return 1
+    command -v sysctl >/dev/null 2>&1 || return 1
+    sysctl -w net.bridge.bridge-nf-call-iptables=1 >/dev/null || return 1
+    sysctl -w net.bridge.bridge-nf-call-ip6tables=1 >/dev/null || return 1
+    mkdir -p /etc/modules-load.d /etc/sysctl.d || return 1
+    if [ ! -f "$module_file" ] || ! grep -Fxq br_netfilter "$module_file"; then
+        printf '%s\n' br_netfilter >"$module_file" || return 1
+    fi
+    local sysctl_file=/etc/sysctl.d/99-oneclickvirt-bridge.conf
+    if [ ! -f "$sysctl_file" ] || ! grep -Eq '^net\.bridge\.bridge-nf-call-iptables=1$' "$sysctl_file"; then
+        printf '%s\n' 'net.bridge.bridge-nf-call-iptables=1' >>"$sysctl_file" || return 1
+    fi
+    if ! grep -Eq '^net\.bridge\.bridge-nf-call-ip6tables=1$' "$sysctl_file"; then
+        printf '%s\n' 'net.bridge.bridge-nf-call-ip6tables=1' >>"$sysctl_file" || return 1
+    fi
+}
+
+save_lxd_nat_rules() {
+    local destination="${1:-/etc/nftables.d/oneclickvirt-lxd.nft}" rules temporary
+    rules=$(nft list table inet lxd_nat) || return 1
+    temporary=$(mktemp "${destination}.XXXXXX") || return 1
+    # Only replace a complete snapshot; a failed read must preserve the last
+    # working file. Flush only our table when loading it again after a reboot.
+    if ! printf '%s\n' '#!/usr/sbin/nft -f' 'add table inet lxd_nat' 'flush table inet lxd_nat' "$rules" >"$temporary" ||
+        ! chmod 644 "$temporary" || ! mv -f -- "$temporary" "$destination"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
+nftables_persistence_file() {
+    case "${SYSTEM:-}" in
+        CentOS|Fedora) printf '%s\n' /etc/sysconfig/nftables.conf ;;
+        Alpine) printf '%s\n' /etc/nftables.nft ;;
+        Debian|Ubuntu|Arch) printf '%s\n' /etc/nftables.conf ;;
+        *) printf '%s\n' 'No supported nftables boot persistence for this system' >&2; return 1 ;;
+    esac
+}
+
+enable_nftables_persistence() {
+    # Enabling is intentionally separate from package discovery and is called
+    # only after the complete snapshot/include exists. Do not start or reload.
+    if [ "${SYSTEM:-}" = Alpine ]; then
+        install_package nftables-openrc || return 1
+    fi
+    service_manager enable nftables || return 1
+}
+
+iptables_persistence_file() {
+    case "${SYSTEM:-}" in
+        Debian|Ubuntu) printf '%s\n' /etc/iptables/rules.v4 ;;
+        CentOS|Fedora) printf '%s\n' /etc/sysconfig/iptables ;;
+        Arch) printf '%s\n' /etc/iptables/iptables.rules ;;
+        Alpine) printf '%s\n' /etc/iptables/rules-save ;;
+        *) printf '%s\n' 'No supported iptables boot persistence for this system' >&2; return 1 ;;
+    esac
+}
+
+ensure_iptables_persistent() {
+    local persistence_service=iptables
+    case "${SYSTEM:-}" in
+        Debian|Ubuntu)
+            DEBIAN_FRONTEND=noninteractive install_package iptables-persistent || return 1
+            persistence_service=netfilter-persistent
+            ;;
+        CentOS|Fedora) install_package iptables-services || return 1 ;;
+        Alpine) install_package iptables-openrc || return 1 ;;
+        Arch) : ;;
+        *) return 1 ;;
+    esac
+    # Enable boot restoration without starting/reloading another live policy.
+    service_manager enable "$persistence_service" || return 1
+}
+
+save_iptables_persistence() {
+    local target="${1:?iptables persistence target is required}" save_command="${2:?iptables save command is required}"
+    local resolved directory temporary
+    if [ -L "$target" ]; then
+        resolved=$(readlink -f -- "$target") || return 1
+        [ -e "$resolved" ] || return 1
+    else
+        resolved="$target"
+    fi
+    directory=$(dirname -- "$resolved") || return 1
+    mkdir -p -- "$directory" || return 1
+    [ ! -e "$resolved" ] || [ -f "$resolved" ] || return 1
+    temporary=$(mktemp "$directory/.oneclickvirt-iptables.XXXXXX") || return 1
+    # Preserve mode/owner of existing policies; a new snapshot starts at 600.
+    if { [ -f "$resolved" ] && ! cp -p -- "$resolved" "$temporary"; } ||
+        ! "$save_command" >"$temporary" || ! mv -f -- "$temporary" "$resolved"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
+configure_nft_masquerade() {
+    local nat_enabled rule=""
+    nat_enabled=$(/snap/bin/lxc network get lxdbr0 ipv4.nat) || return 1
+    if [ "$nat_enabled" = true ]; then
+        rule='add rule inet lxd_nat postrouting_masq meta nfproto ipv4 iifname "lxdbr0" oifname != "lxdbr0" masquerade'
+    fi
+    # Migrate the installer-owned chain atomically. IPv6 routing/NAT remains
+    # controlled by LXD's network settings, including explicit NAT disablement.
+    nft -f - <<NFT || return 1
+add table inet lxd_nat
+add chain inet lxd_nat postrouting_masq { type nat hook postrouting priority srcnat; policy accept; }
+flush chain inet lxd_nat postrouting_masq
+$rule
+NFT
+    sync_lxd_firewalld_masquerade || return 1
+    retire_lxd_iptables_masquerade "$@"
+}
+
+ocv_lock_firewall() {
+    local lock_dir=/run/oneclickvirt-firewall-locks lock_file
+    command -v flock >/dev/null 2>&1 || return 1
+    [ ! -L "$lock_dir" ] || return 1
+    mkdir -p -m 700 -- "$lock_dir" || return 1
+    [ "$(stat -c %u "$lock_dir")" = "$EUID" ] || return 1
+    [ "$(stat -c %a "$lock_dir")" = 700 ] || return 1
+    lock_file="$lock_dir/firewall.lock"
+    [ ! -L "$lock_file" ] || return 1
+    exec {ocv_firewall_lock_fd}>>"$lock_file" || return 1
+    # Keep the inode: unlinking it would let another process bypass this lock.
+    flock -xw 120 "$ocv_firewall_lock_fd" || return 1
+}
+
+ocv_with_firewall_lock() {
+    # The subshell releases the lock on both success and failure.
+    ( ocv_lock_firewall && "$@" )
+}
+
+sync_lxd_firewalld_masquerade() {
+    local subnet="${1:-}" prefix octet active=false state_status=127
+    local permanent_rules="" runtime_rules="" scope rules rule source present
+    local cli=firewall-cmd
+    local octets=() options=() scopes=(permanent)
+    local pattern="^0 -s ([0-9./]+) ['\"]?!['\"]? -o lxdbr0 -m comment --comment ['\"]?oneclickvirt-lxd-ipv4['\"]? -j MASQUERADE$"
+    # Validate before changing either scope, preserving working rules on bad
+    # runtime metadata. An empty subnet means remove only this installer's NAT.
+    if [ -n "$subnet" ]; then
+        [[ "$subnet" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || return 1
+        prefix="${subnet##*/}"
+        ((10#$prefix >= 1 && 10#$prefix <= 32)) || return 1
+        IFS=. read -r -a octets <<<"${subnet%/*}"
+        for octet in "${octets[@]}"; do ((10#$octet <= 255)) || return 1; done
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        state_status=0
+        firewall-cmd --state >/dev/null 2>&1 || state_status=$?
+        # Only NOT_RUNNING permits offline mutation. A D-Bus failure is not
+        # evidence that the daemon stopped; do not overwrite its configuration.
+        if [ "$state_status" -ne 0 ] && [ "$state_status" -ne 252 ]; then
+            # No saved direct configuration means there is nothing for a
+            # stopped/unavailable daemon to restore; kernel cleanup follows.
+            [ -z "$subnet" ] && [ ! -e /etc/firewalld/direct.xml ] && return 0
+            return 1
+        fi
+    fi
+    if [ "$state_status" -eq 0 ]; then
+        active=true
+        permanent_rules=$(firewall-cmd --permanent --direct --get-rules ipv4 nat POSTROUTING) || return 1
+        runtime_rules=$(firewall-cmd --direct --get-rules ipv4 nat POSTROUTING) || return 1
+        scopes+=(runtime)
+    else
+        [ -z "$subnet" ] || return 1
+        # Retire saved rules through the offline API when the daemon is down,
+        # so its next start cannot restore stale NAT. Never edit firewalld XML.
+        [ -f /etc/firewalld/direct.xml ] || return 0
+        local saved_status=0
+        grep -Fq 'oneclickvirt-lxd-ipv4' /etc/firewalld/direct.xml || saved_status=$?
+        [ "$saved_status" -ne 1 ] || return 0
+        [ "$saved_status" -eq 0 ] || return 1
+        [ "$state_status" -eq 252 ] || return 1
+        command -v firewall-offline-cmd >/dev/null 2>&1 || return 1
+        cli=firewall-offline-cmd
+        permanent_rules=$("$cli" --direct --get-rules ipv4 nat POSTROUTING) || return 1
+    fi
+    for scope in "${scopes[@]}"; do
+        options=()
+        rules="$permanent_rules"
+        if [ "$scope" = runtime ]; then
+            rules="$runtime_rules"
+        elif [ "$active" = true ]; then
+            options=(--permanent)
+        fi
+        present=false
+        while IFS= read -r rule; do
+            if [[ "$rule" =~ $pattern ]] && [ "${BASH_REMATCH[1]}" = "$subnet" ]; then present=true; fi
+        done <<<"$rules"
+        if [ -n "$subnet" ] && [ "$present" = false ]; then
+            "$cli" "${options[@]}" --direct --add-rule ipv4 nat POSTROUTING 0 \
+                -s "$subnet" ! -o lxdbr0 -m comment --comment oneclickvirt-lxd-ipv4 -j MASQUERADE || return 1
+        fi
+        # Add the replacement before retiring the old subnet. Rebuild
+        # arguments from a strict match; never evaluate firewall output.
+        while IFS= read -r rule; do
+            if [[ "$rule" =~ $pattern ]]; then
+                source="${BASH_REMATCH[1]}"
+                if [ -z "$subnet" ] || [ "$source" != "$subnet" ]; then
+                    "$cli" "${options[@]}" --direct --remove-rule ipv4 nat POSTROUTING 0 \
+                        -s "$source" ! -o lxdbr0 -m comment --comment oneclickvirt-lxd-ipv4 -j MASQUERADE || return 1
+                fi
+            fi
+        done <<<"$rules"
+    done
+}
+
+configure_firewalld_masquerade() {
+    local nat_enabled subnet="" zone status scope
+    local options=()
+    nat_enabled=$(/snap/bin/lxc network get lxdbr0 ipv4.nat) || return 1
+    if [ "$nat_enabled" = true ]; then
+        subnet=$(/snap/bin/lxc network get lxdbr0 ipv4.address) || return 1
+    fi
+    firewall-cmd --state >/dev/null 2>&1 || return 1
+    sync_lxd_firewalld_masquerade "$subnet" || return 1
+    for scope in permanent runtime; do
+        options=()
+        [ "$scope" != permanent ] || options=(--permanent)
+        status=0
+        zone=$(LC_ALL=C firewall-cmd "${options[@]}" --get-zone-of-interface=lxdbr0 2>&1) || status=$?
+        if [ "$status" -eq 2 ] && [ "$zone" = 'no zone' ]; then
+            firewall-cmd "${options[@]}" --zone=trusted --add-interface=lxdbr0 || return 1
+        elif [ "$status" -ne 0 ]; then
+            return 1
+        fi
+        # Keep an existing runtime or administrator zone assignment.
+    done
+}
+
+remove_lxd_iptables_masquerade() {
+    local rules rule source backend="${1:-iptables}"
+    local pattern='^-A POSTROUTING -s ([0-9./]+) ! -o lxdbr0 -m comment --comment "?oneclickvirt-lxd-ipv4"? -j MASQUERADE$'
+    rules=$("$backend" -w -t nat -S POSTROUTING) || return 1
+    while IFS= read -r rule; do
+        if [[ "$rule" =~ $pattern ]]; then
+            source="${BASH_REMATCH[1]}"
+            "$backend" -w -t nat -D POSTROUTING -s "$source" ! -o lxdbr0 -m comment --comment oneclickvirt-lxd-ipv4 -j MASQUERADE || return 1
+        fi
+    done <<<"$rules"
+}
+
+remove_lxd_iptables_persistence() {
+    local config_file="${1:-/etc/iptables/rules.v4}" temporary
+    [ -f "$config_file" ] || return 0
+    if [ -L "$config_file" ]; then
+        config_file=$(readlink -f -- "$config_file") || return 1
+    fi
+    temporary=$(mktemp "${config_file}.XXXXXX") || return 1
+    # Preserve the saved policy; runtime snapshots may differ from it.
+    if ! cp -p -- "$config_file" "$temporary" || ! awk '
+        /^-A POSTROUTING -s [0-9.]+\/[0-9]+ ! -o lxdbr0 -m comment --comment "?oneclickvirt-lxd-ipv4"? -j MASQUERADE$/ { next }
+        { print }
+    ' "$config_file" >"$temporary" || ! mv -f -- "$temporary" "$config_file"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
+retire_lxd_iptables_masquerade() {
+    local backend config_file version
+    for backend in iptables-nft iptables-legacy iptables; do
+        command -v "$backend" >/dev/null 2>&1 || continue
+        version=$("$backend" --version) || return 1
+        # An unloaded legacy NAT table contains no rules to retire. Avoid
+        # requiring the legacy kernel modules on a host that only uses nft.
+        if [[ "$version" == *legacy* ]]; then
+            [ -e /proc/net/ip_tables_names ] || continue
+            [ -r /proc/net/ip_tables_names ] || return 1
+            grep -Fxq nat /proc/net/ip_tables_names || continue
+        fi
+        remove_lxd_iptables_masquerade "$backend" || return 1
+    done
+    if [ "$#" -eq 0 ]; then
+        set -- /etc/iptables/rules.v4 /etc/sysconfig/iptables /etc/iptables/iptables.rules /etc/iptables/rules-save
+    fi
+    for config_file in "$@"; do
+        remove_lxd_iptables_persistence "$config_file" || return 1
+    done
+}
+
+add_iptables_masq_once() {
+    local nat_enabled subnet prefix octet
+    local subnet_octets=()
+    nat_enabled=$(/snap/bin/lxc network get lxdbr0 ipv4.nat) || return 1
+    if [ "$nat_enabled" != true ]; then
+        remove_lxd_iptables_masquerade
+        return $?
+    fi
+    subnet=$(/snap/bin/lxc network get lxdbr0 ipv4.address) || return 1
+    [[ "$subnet" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || return 1
+    prefix="${subnet##*/}"
+    ((10#$prefix >= 1 && 10#$prefix <= 32)) || return 1
+    IFS=. read -r -a subnet_octets <<<"${subnet%/*}"
+    for octet in "${subnet_octets[@]}"; do
+        ((10#$octet <= 255)) || return 1
+    done
+    remove_lxd_iptables_masquerade || return 1
+    iptables -w -t nat -C POSTROUTING -s "$subnet" ! -o lxdbr0 -m comment --comment oneclickvirt-lxd-ipv4 -j MASQUERADE 2>/dev/null ||
+        iptables -w -t nat -A POSTROUTING -s "$subnet" ! -o lxdbr0 -m comment --comment oneclickvirt-lxd-ipv4 -j MASQUERADE || return 1
+}
+
 setup_network_preferences() {
+    ensure_bridge_netfilter || {
+        _red "br_netfilter is required for LXD host-address proxy port mappings"
+        return 1
+    }
     if [ -f /etc/gai.conf ]; then
         sed -i 's/.*precedence ::ffff:0:0\/96.*/precedence ::ffff:0:0\/96  100/g' /etc/gai.conf
         if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q "networking.service"; then
-            service_manager restart networking
+            service_manager restart networking || return 1
         elif command -v rc-service >/dev/null 2>&1 && rc-service --list | grep -q "networking"; then
-            service_manager restart networking
+            service_manager restart networking || return 1
         fi
     fi
     # 优先使用nftables，不可用时降级为iptables
@@ -1322,62 +1707,39 @@ setup_network_preferences() {
         fi
     fi
     if [ "$fw_backend" = "nft" ]; then
-        if ! nft list table inet lxd_nat >/dev/null 2>&1; then
-            nft add table inet lxd_nat || return 1
-        fi
-        if nft list chain inet lxd_nat postrouting_masq >/dev/null 2>&1; then
-            nft flush chain inet lxd_nat postrouting_masq || return 1
-        else
-            nft 'add chain inet lxd_nat postrouting_masq { type nat hook postrouting priority 100; policy accept; }' || return 1
-        fi
-        nft add rule inet lxd_nat postrouting_masq masquerade || return 1
+        configure_nft_masquerade || return 1
         # Persist only the installer-owned table. Writing `nft list ruleset`
         # here replaces administrator rules and can capture LXD's transient
         # interface-dependent tables before lxdbr0 exists at boot.
         mkdir -p /etc/nftables.d || return 1
-        local nft_file=/etc/nftables.d/oneclickvirt-lxd.nft
-        {
-            echo '#!/usr/sbin/nft -f'
-            nft list table inet lxd_nat
-        } > "$nft_file" || return 1
-        chmod 644 "$nft_file" || return 1
-        if [ -f /etc/nftables.conf ]; then
-            if ! grep -qF 'include "/etc/nftables.d/oneclickvirt-lxd.nft"' /etc/nftables.conf 2>/dev/null &&
-               ! grep -qF 'include "/etc/nftables.d/*.nft"' /etc/nftables.conf 2>/dev/null; then
-                echo 'include "/etc/nftables.d/oneclickvirt-lxd.nft"' >> /etc/nftables.conf || return 1
+        local nft_file=/etc/nftables.d/oneclickvirt-lxd.nft config_file
+        config_file=$(nftables_persistence_file) || return 1
+        save_lxd_nat_rules "$nft_file" || return 1
+        mkdir -p -- "$(dirname -- "$config_file")" || return 1
+        if [ -f "$config_file" ]; then
+            if ! grep -qF 'include "/etc/nftables.d/oneclickvirt-lxd.nft"' "$config_file" 2>/dev/null &&
+               ! grep -qF 'include "/etc/nftables.d/*.nft"' "$config_file" 2>/dev/null; then
+                echo 'include "/etc/nftables.d/oneclickvirt-lxd.nft"' >> "$config_file" || return 1
             fi
         else
-            cat > /etc/nftables.conf <<'NFTEOF' || return 1
+            cat > "$config_file" <<'NFTEOF' || return 1
 #!/usr/sbin/nft -f
 include "/etc/nftables.d/oneclickvirt-lxd.nft"
 NFTEOF
         fi
-        if command -v systemctl >/dev/null 2>&1; then
-            systemctl enable nftables >/dev/null 2>&1 || true
-        fi
+        enable_nftables_persistence || return 1
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+        install_package iptables || return 1
+        configure_firewalld_masquerade || return 1
     else
         install_package iptables || return 1
-        if [ "$SYSTEM" = "Debian" ] || [ "$SYSTEM" = "Ubuntu" ]; then
-            DEBIAN_FRONTEND=noninteractive install_package iptables-persistent
-        elif [ "$SYSTEM" = "Alpine" ]; then
-            if command -v rc-update >/dev/null 2>&1; then
-                rc-update add iptables default 2>/dev/null || true
-            fi
-        elif [ "$SYSTEM" = "CentOS" ] || [ "$SYSTEM" = "Fedora" ]; then
-            if command -v firewall-cmd >/dev/null 2>&1; then
-                _green "firewall-cmd is available, using firewalld for persistence"
-            else
-                install_package iptables-services 2>/dev/null || true
-            fi
-        fi
-        if ! iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null; then
-            iptables -t nat -A POSTROUTING -j MASQUERADE || return 1
-        fi
-        mkdir -p /etc/iptables || return 1
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || return 1
-        if command -v netfilter-persistent >/dev/null 2>&1; then
-            netfilter-persistent save >/dev/null 2>&1
-        fi
+        ensure_iptables_persistent || return 1
+        add_iptables_masq_once || return 1
+        # This branch changes only IPv4 NAT; do not overwrite IPv6 policy via
+        # a global netfilter-persistent save after our atomic snapshot.
+        local policy_file
+        policy_file=$(iptables_persistence_file) || return 1
+        save_iptables_persistence "$policy_file" iptables-save || return 1
     fi
 }
 
@@ -1393,6 +1755,7 @@ show_completion_info() {
 main() {
     set_locale
     install_base_packages || return 1
+    if ! command -v flock >/dev/null 2>&1; then install_package util-linux || return 1; fi
     check_cdn_file
     rebuild_cloud_init
     if command -v apt-get >/dev/null 2>&1; then
@@ -1409,7 +1772,7 @@ main() {
     configure_system || return 1
     remove_system_limits || return 1
     install_dns_check || return 1
-    setup_network_preferences || return 1
+    ocv_with_firewall_lock setup_network_preferences || return 1
     ensure_runtime_network || return 1
     show_completion_info
 }

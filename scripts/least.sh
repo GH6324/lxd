@@ -5,6 +5,36 @@
 # ./least.sh NAT服务器前缀 数量
 # 2026.08.30
 
+# Load before changing directory or touching shared downloads and logs.
+load_instance_ownership() {
+    local script_dir helper temporary
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 1
+    for helper in "$script_dir/instance_ownership.sh" /usr/local/bin/instance_ownership.sh /root/instance_ownership.sh; do
+        if [ -f "$helper" ]; then
+            # shellcheck source=/dev/null
+            . "$helper" || return 1
+            return 0
+        fi
+    done
+    temporary=$(mktemp "${TMPDIR:-/tmp}/lxd-ownership.XXXXXX") || return 1
+    if ! curl -fsSL "https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/instance_ownership.sh" -o "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    # shellcheck source=/dev/null
+    . "$temporary"
+    local status=$?
+    rm -f -- "$temporary"
+    return "$status"
+}
+load_instance_ownership || { echo "Missing instance_ownership.sh; download it with this script." >&2; exit 1; }
+OCV_SCRIPT_RUNTIME=lxd
+OCV_INSTANCE_CLI=lxc
+if [ "${ONECLICKVIRT_TESTING:-}" != "1" ]; then
+    ocv_lock_scripts || exit 1
+fi
+
+
 if [ "${ONECLICKVIRT_TESTING:-}" != "1" ]; then
     cd /root >/dev/null 2>&1 || exit 1
     if [ ! -d "/usr/local/bin" ]; then
@@ -24,6 +54,7 @@ lxd_storage_pool() {
 batch_active=false
 batch_pending_log=""
 batch_created=()
+batch_identities=()
 
 lxc_instance_exists() {
     lxc info "$1" >/dev/null 2>&1
@@ -31,21 +62,24 @@ lxc_instance_exists() {
 
 track_batch_instance() {
     local candidate="$1"
+    [ -n "${ocv_created_identity:-}" ] || return 1
     local tracked
     for tracked in "${batch_created[@]}"; do
         [ "$tracked" = "$candidate" ] && return 0
     done
     batch_created+=("$candidate")
+    batch_identities+=("$ocv_created_identity")
 }
 
 rollback_batch() {
     local index instance_name
     for ((index = ${#batch_created[@]} - 1; index >= 0; index--)); do
         instance_name="${batch_created[index]}"
-        lxc delete --force "$instance_name" >/dev/null 2>&1 || true
+        ocv_remove_owned_instance "$instance_name" "${batch_identities[index]}" || echo "Failed to roll back instance: $instance_name" >&2
     done
     [ -z "$batch_pending_log" ] || rm -f -- "$batch_pending_log"
     batch_created=()
+    batch_identities=()
     batch_pending_log=""
     batch_active=false
 }
@@ -71,6 +105,7 @@ commit_batch_log() {
     mv -f -- "$batch_pending_log" log || return 1
     batch_pending_log=""
     batch_created=()
+    batch_identities=()
     batch_active=false
 }
 
@@ -100,23 +135,26 @@ detect_firewall_backend() {
     if command -v apt-get >/dev/null 2>&1; then
         DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent >/dev/null 2>&1
     fi
+    command -v iptables >/dev/null 2>&1 || return 1
+    command -v ip6tables >/dev/null 2>&1 || return 1
     return 0
 }
 
 save_firewall_rules() {
     if [ "$FW_BACKEND" = "nft" ]; then
-        nft list ruleset > /etc/nftables.conf 2>/dev/null
+        nft list ruleset > /etc/nftables.conf 2>/dev/null || return 1
         if command -v systemctl >/dev/null 2>&1; then
-            systemctl enable nftables >/dev/null 2>&1
+            systemctl enable nftables >/dev/null 2>&1 || return 1
         fi
     else
-        mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null
-        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
+        mkdir -p /etc/iptables || return 1
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || return 1
+        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || return 1
         if command -v netfilter-persistent >/dev/null 2>&1; then
-            netfilter-persistent save >/dev/null 2>&1
+            netfilter-persistent save >/dev/null 2>&1 || return 1
         fi
     fi
+    return 0
 }
 
 check_china() {
@@ -179,11 +217,11 @@ if ! begin_batch; then
     echo "无法创建批量日志暂存文件" >&2
     exit 1
 fi
-if lxc init opsmaru:debian/12 "$1" -c limits.cpu=1 -c limits.memory=128MiB -s "$storage_pool"; then
-    track_batch_instance "$1"
+if ocv_create_owned "$1" lxc init opsmaru:debian/12 "$1" -c limits.cpu=1 -c limits.memory=128MiB -s "$storage_pool"; then
+    track_batch_instance "$1" || return 1
 else
     init_status=$?
-    lxc_instance_exists "$1" && track_batch_instance "$1"
+    track_batch_instance "$1" || true
     echo "基础容器创建失败，已停止后续配置" >&2
     return "$init_status"
 fi
@@ -214,26 +252,26 @@ lxc config set "$1" security.nesting true || return 1
 #   lxc config set "$1" security.syscalls.intercept.setxattr true
 # fi
 # 屏蔽端口
-detect_firewall_backend
+detect_firewall_backend || return 1
 blocked_ports=(3389 8888 54321 65432)
 if [ "$FW_BACKEND" = "nft" ]; then
-    nft list table inet lxd_block >/dev/null 2>&1 || nft add table inet lxd_block
-    nft flush chain inet lxd_block forward_block 2>/dev/null
+    nft list table inet lxd_block >/dev/null 2>&1 || nft add table inet lxd_block || return 1
+    nft flush chain inet lxd_block forward_block 2>/dev/null || true
     nft list chain inet lxd_block forward_block >/dev/null 2>&1 || \
-        nft 'add chain inet lxd_block forward_block { type filter hook forward priority 0; policy accept; }'
+        nft 'add chain inet lxd_block forward_block { type filter hook forward priority 0; policy accept; }' || return 1
     for port in "${blocked_ports[@]}"; do
-        nft add rule inet lxd_block forward_block oifname "eth0" tcp dport "$port" drop
-        nft add rule inet lxd_block forward_block oifname "eth0" udp dport "$port" drop
+        nft add rule inet lxd_block forward_block oifname "eth0" tcp dport "$port" drop || return 1
+        nft add rule inet lxd_block forward_block oifname "eth0" udp dport "$port" drop || return 1
     done
 else
     for port in "${blocked_ports[@]}"; do
         iptables -C FORWARD -o eth0 -p tcp --dport "$port" -j DROP 2>/dev/null || \
-            iptables -I FORWARD -o eth0 -p tcp --dport "$port" -j DROP
+            iptables -I FORWARD -o eth0 -p tcp --dport "$port" -j DROP || return 1
         iptables -C FORWARD -o eth0 -p udp --dport "$port" -j DROP 2>/dev/null || \
-            iptables -I FORWARD -o eth0 -p udp --dport "$port" -j DROP
+            iptables -I FORWARD -o eth0 -p udp --dport "$port" -j DROP || return 1
     done
 fi
-save_firewall_rules
+save_firewall_rules || return 1
 if [ ! -f /usr/local/bin/ssh_bash.sh ]; then
     download_host_file https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/ssh_bash.sh /usr/local/bin/ssh_bash.sh
     chmod 777 /usr/local/bin/ssh_bash.sh || return 1
@@ -253,11 +291,11 @@ for ((a = 1; a <= "$2"; a++)); do
         echo "容器已存在，未修改既有实例：$name" >&2
         exit 1
     fi
-    if lxc copy "$1" "$name"; then
-        track_batch_instance "$name"
+    if ocv_create_owned "$name" lxc copy "$1" "$name"; then
+        track_batch_instance "$name" || return 1
     else
         copy_status=$?
-        lxc_instance_exists "$name" && track_batch_instance "$name"
+        track_batch_instance "$name" || true
         echo "容器复制失败：${name}，已停止后续创建" >&2
         return "$copy_status"
     fi
@@ -291,7 +329,7 @@ for ((a = 1; a <= "$2"; a++)); do
     echo "Host IPv4 address: $ipv4_address"
     if [[ "${CN}" == true ]]; then
         lxc exec "$name" -- apt-get install curl -y --fix-missing || return 1
-        lxc exec "$name" -- curl -lk https://gitee.com/SuperManito/LinuxMirrors/raw/main/ChangeMirrors.sh -o ChangeMirrors.sh || return 1
+        lxc exec "$name" -- curl -fLk https://gitee.com/SuperManito/LinuxMirrors/raw/main/ChangeMirrors.sh -o ChangeMirrors.sh || return 1
         lxc exec "$name" -- chmod 777 ChangeMirrors.sh || return 1
         lxc exec "$name" -- ./ChangeMirrors.sh --source mirrors.tuna.tsinghua.edu.cn --web-protocol http --intranet false --backup true --updata-software false --clean-cache false --ignore-backup-tips || return 1
         lxc exec "$name" -- rm -f -- ChangeMirrors.sh || return 1

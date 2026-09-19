@@ -44,19 +44,18 @@ service_manager() {
 # 环境安装
 # 安装vnstat
 if command -v apt >/dev/null 2>&1; then
-    apt update
-    apt install wget sudo curl -y
+    apt update && apt install wget sudo curl -y || { echo "Failed to install base dependencies." >&2; exit 1; }
 elif command -v apk >/dev/null 2>&1; then
-    apk update
-    apk add --no-cache wget sudo curl
+    apk update && apk add --no-cache wget sudo curl || { echo "Failed to install base dependencies." >&2; exit 1; }
 elif command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --noconfirm wget sudo curl
+    pacman -Sy --noconfirm wget sudo curl || { echo "Failed to install base dependencies." >&2; exit 1; }
 elif command -v yum >/dev/null 2>&1; then
-    yum update -y
-    yum install -y wget sudo curl
+    yum update -y && yum install -y wget sudo curl || { echo "Failed to install base dependencies." >&2; exit 1; }
 elif command -v dnf >/dev/null 2>&1; then
-    dnf update -y
-    dnf install -y wget sudo curl
+    dnf update -y && dnf install -y wget sudo curl || { echo "Failed to install base dependencies." >&2; exit 1; }
+else
+    echo "No supported package manager found." >&2
+    exit 1
 fi
 # apt install linux-headers-$(uname -r) -y
 # wget https://github.com/vergoh/vnstat/releases/download/v2.10/vnstat-2.10.tar.gz
@@ -86,22 +85,28 @@ fi
 # vnstatd -v
 # ! vnstati -v && echo "vnstat 编译安装无vnstati工具，如需使用请使用命令 apt install vnstati -y 覆盖安装apt源版本"
 if command -v apt >/dev/null 2>&1; then
-    apt install make gcc libc6-dev libsqlite3-0 libsqlite3-dev libgd3 libgd-dev -y
+    apt install make gcc libc6-dev libsqlite3-0 libsqlite3-dev libgd3 libgd-dev -y || exit 1
 elif command -v apk >/dev/null 2>&1; then
-    apk add --no-cache make gcc libc-dev sqlite-dev gd-dev
+    apk add --no-cache make gcc libc-dev sqlite-dev gd-dev || exit 1
 elif command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --noconfirm make gcc sqlite gd
+    pacman -Sy --noconfirm make gcc sqlite gd || exit 1
 elif command -v yum >/dev/null 2>&1; then
-    yum install -y make gcc glibc-devel sqlite-devel gd-devel
+    yum install -y make gcc glibc-devel sqlite-devel gd-devel || exit 1
 elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y make gcc glibc-devel sqlite-devel gd-devel
+    dnf install -y make gcc glibc-devel sqlite-devel gd-devel || exit 1
+else
+    echo "No supported package manager found for vnStat build." >&2
+    exit 1
 fi
 cd /usr/src || exit 1
-if ! wget https://humdi.net/vnstat/vnstat-2.11.tar.gz; then
+vnstat_archive_tmp=$(mktemp /usr/src/vnstat-2.11.tar.gz.tmp.XXXXXX) || exit 1
+if ! wget -q https://humdi.net/vnstat/vnstat-2.11.tar.gz -O "$vnstat_archive_tmp" || [ ! -s "$vnstat_archive_tmp" ]; then
+    rm -f -- "$vnstat_archive_tmp"
     echo "Failed to download vnstat source."
     exit 1
 fi
-chmod 777 vnstat-2.11.tar.gz
+mv -f -- "$vnstat_archive_tmp" /usr/src/vnstat-2.11.tar.gz || exit 1
+chmod 755 vnstat-2.11.tar.gz
 if ! tar zxvf vnstat-2.11.tar.gz; then
     echo "Failed to extract vnstat source."
     exit 1
@@ -111,10 +116,10 @@ if ! ./configure --prefix=/usr --sysconfdir=/etc || ! make || ! make install; th
     echo "Failed to build vnstat."
     exit 1
 fi
-cp -v examples/systemd/vnstat.service /etc/systemd/system/
-service_manager enable vnstat
-service_manager start vnstat
-pgrep -c vnstatd
-vnstat -v
+cp -v examples/systemd/vnstat.service /etc/systemd/system/ || exit 1
+service_manager enable vnstat || { echo "Failed to enable vnStat service." >&2; exit 1; }
+service_manager start vnstat || { echo "Failed to start vnStat service." >&2; exit 1; }
+pgrep -c vnstatd >/dev/null || { echo "vnStat daemon is not running." >&2; exit 1; }
+vnstat -v || exit 1
 vnstatd -v
 vnstati -v
